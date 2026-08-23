@@ -1,0 +1,22 @@
+{
+  "name": "godprotocol-cli",
+  "version": "0.1.0",
+  "description": "GodProtocol Node.js framework CLI",
+  "type": "module",
+  "bin": {
+    "godprotocol-cli": "./bin/godprotocol-cli.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "templates"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bin/godprotocol-cli.js",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
