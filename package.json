@@ -1,6 +1,6 @@
 {
   "name": "godprotocol-cli",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "description": "GodProtocol Node.js framework CLI",
   "type": "module",
   "bin": {
@@ -18,5 +18,13 @@
     "start": "node bin/godprotocol-cli.js",
     "test": "node --test"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/immanuel-savvy/godprotocol-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/immanuel-savvy/godprotocol-cli/issues"
+  },
+  "homepage": "https://github.com/immanuel-savvy/godprotocol-cli#readme",
   "license": "MIT"
 }
