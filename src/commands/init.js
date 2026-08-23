@@ -30,7 +30,7 @@ export async function init() {
 
     const targetPath = path.join(
       targetRoot,
-      relativePath.replaceAll("__PROJECT_NAME__", projectName)
+      relativePath.replaceAll("__PROJECT_NAME__", projectName),
     );
 
     await fs.mkdir(path.dirname(targetPath), { recursive: true });
@@ -52,8 +52,16 @@ export async function init() {
   console.log("GodProtocol project initialized.");
   console.log("");
   console.log("Next steps:");
-  console.log("  npm install express");
-  console.log("  node index.js");
+  console.log("");
+  console.log("  1. Install dependencies:");
+  console.log("     npm install");
+  console.log("     npm install godprotocol");
+  console.log("");
+  console.log("  2. Configure your environment:");
+  console.log("     .env");
+  console.log("");
+  console.log("  3. Start the application:");
+  console.log("     node index.js");
   console.log("");
 }
 
