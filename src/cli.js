@@ -1,7 +1,7 @@
 import { init } from "./commands/init.js";
+import { docs } from "./commands/docs.js";
 
 const args = process.argv.slice(2);
-
 const command = args[0];
 
 switch (command) {
@@ -9,23 +9,19 @@ switch (command) {
     await init(args[1]);
     break;
 
-  case undefined:
-    printHelp();
-
+  case "docs":
+    await docs(args.slice(1)); // pass remaining args to docs
     break;
 
+  case undefined:
   case "-h":
-
   case "--help":
     printHelp();
-
     break;
 
   case "-v":
-
   case "--version":
     await printVersion();
-
     break;
 
   default:
