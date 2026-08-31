@@ -125,7 +125,9 @@ function parseRouteEntries(text) {
      * handler: foo_bar
      * handler: $foo
      */
-    const handlerMatch = bodyText.match(/\bhandler\s*:\s*([A-Za-z_$][\w$]*)/);
+    const handlerMatch = bodyText.match(
+      /\bhandler\s*:\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)/,
+    );
 
     /*
      * security: "auth"

@@ -1,500 +1,1559 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
 /*
- * Dependency-free handler scanner.
+ * Handler/documentation scanner.
  *
- * Extracts:
- * - purpose / leading comments
- * - response status
- * - response status_code
- * - response ok
- * - response data fields
- * - errors
+ * IMPORTANT:
+ * This intentionally does NOT use an AST dependency.
+ *
+ * The scanner uses a small JavaScript lexical/parser layer sufficient for
+ * documentation extraction:
+ *
+ * - imports
+ * - functions
+ * - arrow functions
+ * - returns
+ * - object literals
+ * - arrays
  * - service calls
- * - service method
- * - service call arguments/context
  *
- * No external dependencies.
+ * It only follows local imports.
+ *
+ * It NEVER follows:
+ *
+ *   node_modules
+ *   package imports
+ *   node:
+ *   bare imports
+ *
+ * Circular imports/functions are protected by visited sets.
  */
 
-export function extractHandlerDetails(handlerBody) {
+const DEFAULT_MAX_FILES = 100;
+const DEFAULT_MAX_FUNCTIONS = 500;
+const DEFAULT_MAX_DEPTH = 20;
+
+const JS_EXTENSIONS = [".js", ".mjs", ".cjs", ".jsx"];
+
+export async function extractHandlerDetails(handlerBody, options = {}) {
   if (!handlerBody) {
     return {
       purpose: null,
       responseDataFields: [],
-      responses: [],
       errors: [],
       externalServices: [],
     };
   }
 
-  const responses = extractResponses(handlerBody);
+  const handlerFile = options.handlerFile
+    ? path.resolve(options.handlerFile)
+    : null;
+
+  const projectRoot = options.projectRoot
+    ? path.resolve(options.projectRoot)
+    : handlerFile
+      ? findProjectRoot(handlerFile)
+      : process.cwd();
+
+  const context = {
+    projectRoot,
+
+    maxFiles:
+      Number(options.maxFiles) > 0
+        ? Number(options.maxFiles)
+        : DEFAULT_MAX_FILES,
+
+    maxFunctions:
+      Number(options.maxFunctions) > 0
+        ? Number(options.maxFunctions)
+        : DEFAULT_MAX_FUNCTIONS,
+
+    maxDepth:
+      Number(options.maxDepth) > 0
+        ? Number(options.maxDepth)
+        : DEFAULT_MAX_DEPTH,
+
+    visitedFiles: new Set(),
+    visitedFunctions: new Set(),
+
+    files: new Map(),
+    functions: new Map(),
+
+    aliases: new Map(),
+
+    responseFields: new Map(),
+    errors: [],
+    externalServices: [],
+
+    currentFile: handlerFile,
+  };
+
+  /*
+   * The handler itself must be scanned even when we don't know its
+   * physical file. This gives us the normal non-recursive behaviour.
+   */
+  const handlerSource = stripSourceForScanning(handlerBody);
+
+  if (handlerFile) {
+    context.files.set(handlerFile, {
+      file: handlerFile,
+      source: handlerSource,
+    });
+
+    await discoverFile(handlerFile, handlerSource, context);
+  } else {
+    registerFunctionsFromSource(handlerSource, null, context);
+  }
+
+  /*
+   * Register the handler source functions.
+   */
+  registerFunctionsFromSource(handlerSource, handlerFile, context);
+
+  /*
+   * Analyze the handler itself.
+   */
+  analyzeSource(handlerSource, handlerFile, context, 0);
+
+  /*
+   * Analyze all known functions that have been discovered.
+   *
+   * This is deliberately iterative instead of recursive over the function
+   * list itself. That makes it much harder for circular code to lock us.
+   */
+  let processed = new Set();
+
+  for (;;) {
+    if (processed.size >= context.maxFunctions) {
+      break;
+    }
+
+    const pending = [...context.functions.entries()].filter(
+      ([key]) => !processed.has(key),
+    );
+
+    if (pending.length === 0) {
+      break;
+    }
+
+    for (const [key, fn] of pending) {
+      if (processed.size >= context.maxFunctions) {
+        break;
+      }
+
+      processed.add(key);
+
+      analyzeFunction(fn, context, 0);
+    }
+  }
 
   return {
     purpose: extractLeadingComment(handlerBody),
-    responseDataFields: extractResponseDataFields(handlerBody),
-    responses,
-    errors: responses.filter((r) => {
-      if (r.status == null) return false;
-      return r.status >= 400;
-    }),
-    externalServices: extractExternalServiceCalls(handlerBody),
+
+    responseDataFields: [...context.responseFields.values()].sort(
+      compareResponseFields,
+    ),
+
+    errors: dedupeErrors(context.errors),
+
+    externalServices: dedupeExternalServices(context.externalServices),
   };
 }
 
 /* -------------------------------------------------------------------------- */
-/* Purpose                                                                    */
+/* FILE DISCOVERY                                                             */
 /* -------------------------------------------------------------------------- */
 
-function extractLeadingComment(body) {
-  const trimmed = body.trim();
+async function discoverFile(file, source, context) {
+  const resolved = path.resolve(file);
 
-  const lineComment = trimmed.match(/^\/\/\s*(.+?)(?:\r?\n|$)/);
-  if (lineComment) {
-    return lineComment[1].trim();
+  if (context.visitedFiles.has(resolved)) {
+    return;
   }
 
-  const blockComment = trimmed.match(/^\/\*\*?\s*([\s\S]*?)\s*\*\//);
+  if (context.visitedFiles.size >= context.maxFiles) {
+    return;
+  }
 
-  if (blockComment) {
-    return blockComment[1]
-      .split(/\r?\n/)
-      .map((line) => line.replace(/^\s*\*\s?/, "").trim())
-      .filter(Boolean)
-      .join(" ");
+  context.visitedFiles.add(resolved);
+
+  context.files.set(resolved, {
+    file: resolved,
+    source,
+  });
+
+  const imports = extractImports(source);
+
+  for (const imported of imports) {
+    if (!isLocalImport(imported.source)) {
+      continue;
+    }
+
+    const importedFile = await resolveLocalImport(
+      resolved,
+      imported.source,
+      context,
+    );
+
+    if (!importedFile) {
+      continue;
+    }
+
+    let importedSource;
+
+    try {
+      importedSource = await fs.readFile(importedFile, "utf8");
+    } catch {
+      continue;
+    }
+
+    importedSource = stripSourceForScanning(importedSource);
+
+    /*
+     * Register aliases such as:
+     *
+     * import { buildSchedule as build } from "../helpers";
+     */
+    for (const specifier of imported.specifiers) {
+      if (specifier.imported && specifier.local) {
+        context.aliases.set(`${resolved}:${specifier.local}`, {
+          importedName: specifier.imported,
+          file: importedFile,
+        });
+      }
+
+      if (specifier.default && specifier.local) {
+        context.aliases.set(`${resolved}:${specifier.local}`, {
+          importedName: "default",
+          file: importedFile,
+        });
+      }
+
+      if (specifier.namespace && specifier.local) {
+        context.aliases.set(`${resolved}:${specifier.local}`, {
+          importedName: "*",
+          file: importedFile,
+        });
+      }
+    }
+
+    await discoverFile(importedFile, importedSource, context);
+
+    registerFunctionsFromSource(importedSource, importedFile, context);
+  }
+}
+
+function isLocalImport(source) {
+  return (
+    typeof source === "string" &&
+    (source.startsWith("./") ||
+      source.startsWith("../") ||
+      source === "." ||
+      source === "..")
+  );
+}
+
+async function resolveLocalImport(importer, importPath, context) {
+  if (!isLocalImport(importPath)) {
+    return null;
+  }
+
+  const importerDir = path.dirname(importer);
+
+  const absolute = path.resolve(importerDir, importPath);
+
+  /*
+   * Never permit a local import to resolve into node_modules.
+   */
+  const nodeModulesSegment = `${path.sep}node_modules${path.sep}`;
+
+  if (absolute.includes(nodeModulesSegment)) {
+    return null;
+  }
+
+  const candidates = [];
+
+  if (path.extname(absolute)) {
+    candidates.push(absolute);
+  } else {
+    for (const ext of JS_EXTENSIONS) {
+      candidates.push(`${absolute}${ext}`);
+    }
+
+    for (const ext of JS_EXTENSIONS) {
+      candidates.push(path.join(absolute, `index${ext}`));
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (await exists(candidate)) {
+      return path.resolve(candidate);
+    }
   }
 
   return null;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Responses                                                                  */
+/* IMPORTS                                                                    */
 /* -------------------------------------------------------------------------- */
 
-function extractResponses(source) {
-  const responses = [];
-  const returnPattern = /\breturn\s*(?=\{)/g;
+function extractImports(source) {
+  const imports = [];
+
+  /*
+   * import x from "./x";
+   * import { a, b as c } from "./x";
+   * import * as x from "./x";
+   */
+  const importRegex = /\bimport\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/g;
 
   let match;
 
-  while ((match = returnPattern.exec(source))) {
-    const openIndex = source.indexOf("{", match.index);
-
-    if (openIndex === -1) continue;
-
-    const closeIndex = findMatchingClose(source, openIndex, "{", "}");
-
-    if (closeIndex === -1) continue;
-
-    const objectText = source.slice(openIndex + 1, closeIndex);
-
-    const response = parseResponseObject(objectText);
-
-    if (response) {
-      responses.push(response);
-    }
-
-    returnPattern.lastIndex = closeIndex + 1;
+  while ((match = importRegex.exec(source))) {
+    imports.push({
+      source: match[2],
+      specifiers: parseImportSpecifiers(match[1]),
+    });
   }
-
-  return dedupeResponses(responses);
-}
-
-function parseResponseObject(objectText) {
-  const status = extractNumericProperty(objectText, "status");
-
-  const statusCode = extractStringProperty(objectText, "status_code");
-
-  const ok = extractBooleanProperty(objectText, "ok");
-
-  const message = extractStringProperty(objectText, "message");
-
-  const dataObject = extractPropertyObject(objectText, "data");
-
-  const dataFields = dataObject ? extractObjectKeys(dataObject) : [];
 
   /*
-   * Don't create a response record for arbitrary objects that merely
-   * happen to be returned unless they look like a standard API response.
+   * import "./side-effect";
    */
-  if (status == null && !statusCode && ok == null && !message && !dataObject) {
-    return null;
+  const sideEffectRegex = /\bimport\s*["']([^"']+)["']/g;
+
+  while ((match = sideEffectRegex.exec(source))) {
+    imports.push({
+      source: match[1],
+      specifiers: [],
+    });
   }
 
-  return {
-    status,
-    status_code: statusCode,
-    ok,
-    meaning: message,
-    data: dataFields,
-  };
+  /*
+   * const x = require("./x")
+   *
+   * This is only followed when the require path is local.
+   */
+  const requireRegex = /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g;
+
+  while ((match = requireRegex.exec(source))) {
+    imports.push({
+      source: match[1],
+      specifiers: [],
+    });
+  }
+
+  return imports;
 }
 
-function dedupeResponses(responses) {
-  const seen = new Set();
+function parseImportSpecifiers(text) {
   const result = [];
 
-  for (const response of responses) {
-    const key = JSON.stringify(response);
+  let value = text.trim();
 
-    if (seen.has(key)) continue;
+  /*
+   * Default import:
+   *
+   * import foo from "./foo"
+   */
+  if (!value.startsWith("{") && !value.startsWith("*")) {
+    const comma = value.indexOf(",");
 
-    seen.add(key);
-    result.push(response);
+    const local = comma === -1 ? value.trim() : value.slice(0, comma).trim();
+
+    if (local) {
+      result.push({
+        default: true,
+        local,
+      });
+    }
+
+    if (comma !== -1) {
+      value = value.slice(comma + 1).trim();
+    } else {
+      return result;
+    }
+  }
+
+  /*
+   * Namespace:
+   *
+   * import * as foo from "./foo"
+   */
+  if (value.startsWith("*")) {
+    const match = value.match(/\*\s+as\s+([A-Za-z_$][\w$]*)/);
+
+    if (match) {
+      result.push({
+        namespace: true,
+        local: match[1],
+      });
+    }
+
+    return result;
+  }
+
+  /*
+   * Named:
+   *
+   * import { foo, bar as baz } from "./foo"
+   */
+  const start = value.indexOf("{");
+
+  const end = value.lastIndexOf("}");
+
+  if (start !== -1 && end !== -1) {
+    const inside = value.slice(start + 1, end);
+
+    for (const item of splitTopLevel(inside, ",")) {
+      const part = item.trim();
+
+      if (!part) continue;
+
+      const pieces = part.split(/\s+as\s+/).map((x) => x.trim());
+
+      result.push({
+        imported: pieces[0],
+        local: pieces[1] ?? pieces[0],
+      });
+    }
   }
 
   return result;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Response data                                                              */
+/* FUNCTION DISCOVERY                                                         */
 /* -------------------------------------------------------------------------- */
 
-function extractResponseDataFields(source) {
-  const fields = new Set();
+function registerFunctionsFromSource(source, file, context) {
+  if (!source || context.functions.size >= context.maxFunctions) {
+    return;
+  }
 
-  const returnPattern = /\breturn\s*(?=\{)/g;
+  /*
+   * function foo(...) { ... }
+   */
+  const declarationRegex = /\b(?:async\s+)?function\s*([A-Za-z_$][\w$]*)\s*\(/g;
 
   let match;
 
-  while ((match = returnPattern.exec(source))) {
-    const openIndex = source.indexOf("{", match.index);
+  while ((match = declarationRegex.exec(source))) {
+    const name = match[1];
 
-    if (openIndex === -1) continue;
+    const openParen = source.indexOf("(", match.index);
 
-    const closeIndex = findMatchingClose(source, openIndex, "{", "}");
+    const closeParen = findMatchingClose(source, openParen, "(", ")");
 
-    if (closeIndex === -1) continue;
-
-    const objectText = source.slice(openIndex + 1, closeIndex);
-
-    const dataObject = extractPropertyObject(objectText, "data");
-
-    if (dataObject) {
-      for (const field of extractObjectKeys(dataObject)) {
-        fields.add(field);
-      }
+    if (closeParen === -1) {
+      continue;
     }
 
-    returnPattern.lastIndex = closeIndex + 1;
+    const openBrace = findNextCodeChar(source, closeParen + 1, "{");
+
+    if (openBrace === -1) {
+      continue;
+    }
+
+    const closeBrace = findMatchingClose(source, openBrace, "{", "}");
+
+    if (closeBrace === -1) {
+      continue;
+    }
+
+    const params = source.slice(openParen + 1, closeParen);
+
+    const body = source.slice(openBrace + 1, closeBrace);
+
+    registerFunction(context, {
+      name,
+      file,
+      params,
+      body,
+      kind: "function",
+    });
   }
 
-  return [...fields];
+  /*
+   * const foo = (...) => { ... }
+   * let foo = (...) => ({ ... })
+   */
+  const arrowRegex =
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g;
+
+  while ((match = arrowRegex.exec(source))) {
+    const name = match[1];
+    const paramsText = match[2];
+
+    const arrowIndex = source.indexOf("=>", match.index);
+
+    if (arrowIndex === -1) {
+      continue;
+    }
+
+    let cursor = skipWhitespaceAndComments(source, arrowIndex + 2);
+
+    let body = "";
+
+    if (source[cursor] === "{") {
+      const closeBrace = findMatchingClose(source, cursor, "{", "}");
+
+      if (closeBrace === -1) {
+        continue;
+      }
+
+      body = source.slice(cursor + 1, closeBrace);
+    } else if (source[cursor] === "(") {
+      const closeParen = findMatchingClose(source, cursor, "(", ")");
+
+      if (closeParen === -1) {
+        continue;
+      }
+
+      body = `return ${source.slice(cursor + 1, closeParen)};`;
+    } else {
+      const end = findExpressionEnd(source, cursor);
+
+      body = `return ${source.slice(cursor, end)};`;
+    }
+
+    const params = paramsText.startsWith("(")
+      ? paramsText.slice(1, -1)
+      : paramsText;
+
+    registerFunction(context, {
+      name,
+      file,
+      params,
+      body,
+      kind: "arrow",
+    });
+  }
+
+  /*
+   * exports.foo = function (...) {}
+   * module.exports.foo = function (...) {}
+   */
+  const exportedFunctionRegex =
+    /\b(?:exports|module\.exports)\.([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?function\s*\(/g;
+
+  while ((match = exportedFunctionRegex.exec(source))) {
+    const name = match[1];
+
+    const openParen = source.indexOf("(", match.index);
+
+    const closeParen = findMatchingClose(source, openParen, "(", ")");
+
+    if (closeParen === -1) {
+      continue;
+    }
+
+    const openBrace = findNextCodeChar(source, closeParen + 1, "{");
+
+    if (openBrace === -1) {
+      continue;
+    }
+
+    const closeBrace = findMatchingClose(source, openBrace, "{", "}");
+
+    if (closeBrace === -1) {
+      continue;
+    }
+
+    registerFunction(context, {
+      name,
+      file,
+      params: source.slice(openParen + 1, closeParen),
+      body: source.slice(openBrace + 1, closeBrace),
+      kind: "exported-function",
+    });
+  }
 }
 
-function extractObjectKeys(objectText) {
-  const entries = splitTopLevelEntries(objectText);
-  const fields = [];
+function registerFunction(context, fn) {
+  if (!fn.name || context.functions.size >= context.maxFunctions) {
+    return;
+  }
 
-  for (const entry of entries) {
-    const trimmed = entry.trim();
+  const key = `${fn.file ?? "<inline>"}:${fn.name}`;
 
-    if (!trimmed) continue;
+  if (context.functions.has(key)) {
+    return;
+  }
+
+  context.functions.set(key, {
+    ...fn,
+    key,
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* ANALYSIS                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function analyzeSource(source, file, context, depth) {
+  if (!source || depth > context.maxDepth) {
+    return;
+  }
+
+  analyzeReturns(source, file, context, depth);
+
+  analyzeErrors(source, file, context);
+
+  analyzeExternalServices(source, file, context);
+
+  /*
+   * Find calls to known functions and make sure their returned structures
+   * are available to the response shape.
+   */
+  const calls = extractFunctionCalls(source);
+
+  for (const call of calls) {
+    resolveAndAnalyzeFunction(call.name, file, context, depth + 1);
+  }
+}
+
+function analyzeFunction(fn, context, depth) {
+  if (!fn || depth > context.maxDepth) {
+    return;
+  }
+
+  const key = fn.key;
+
+  /*
+   * This is the primary circular-recursion protection.
+   */
+  if (context.visitedFunctions.has(key)) {
+    return;
+  }
+
+  context.visitedFunctions.add(key);
+
+  analyzeSource(fn.body, fn.file, context, depth);
+}
+
+function resolveAndAnalyzeFunction(name, currentFile, context, depth) {
+  if (!name || depth > context.maxDepth) {
+    return;
+  }
+
+  /*
+   * Strip property access:
+   *
+   * helpers.build()
+   *
+   * We can still attempt to resolve "build".
+   */
+  const cleanName = name.includes(".") ? name.split(".").pop() : name;
+
+  /*
+   * First try a function in the current file.
+   */
+  const localKey = `${currentFile ?? "<inline>"}:${cleanName}`;
+
+  const localFn = context.functions.get(localKey);
+
+  if (localFn) {
+    analyzeFunction(localFn, context, depth);
+    return;
+  }
+
+  /*
+   * Then look through imported aliases.
+   */
+  if (currentFile) {
+    const alias = context.aliases.get(`${currentFile}:${cleanName}`);
+
+    if (alias) {
+      const targetKey = `${alias.file}:${alias.importedName}`;
+
+      const importedFn = context.functions.get(targetKey);
+
+      if (importedFn) {
+        analyzeFunction(importedFn, context, depth);
+        return;
+      }
+
+      /*
+       * Default exports are often represented by a function named
+       * "default" or by the basename of the file.
+       */
+      if (alias.importedName === "default") {
+        const fallback = [...context.functions.values()].find(
+          (fn) => fn.file === alias.file,
+        );
+
+        if (fallback) {
+          analyzeFunction(fallback, context, depth);
+        }
+      }
+    }
+  }
+
+  /*
+   * Last resort: find a uniquely named function anywhere in our local
+   * import graph.
+   */
+  const matches = [...context.functions.values()].filter(
+    (fn) => fn.name === cleanName,
+  );
+
+  if (matches.length === 1) {
+    analyzeFunction(matches[0], context, depth);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* RETURNS                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function analyzeReturns(source, file, context, depth) {
+  const returns = findReturnExpressions(source);
+
+  for (const expression of returns) {
+    const value = expression.expression.trim();
 
     /*
-     * key: value
-     * "key": value
-     * 'key': value
-     * `key`: value
+     * return {
+     *   ...
+     * }
      */
-    const keyMatch = trimmed.match(
-      /^(?:"([^"]+)"|'([^']+)'|`([^`]+)`|([A-Za-z_$][\w$]*))\s*:/,
-    );
+    if (value.startsWith("{")) {
+      const object = parseObjectLiteral(value);
 
-    if (keyMatch) {
-      fields.push(keyMatch[1] ?? keyMatch[2] ?? keyMatch[3] ?? keyMatch[4]);
+      if (object) {
+        /*
+         * A return object can itself be the StandardResponse:
+         *
+         * return {
+         *   ok: true,
+         *   status: 201,
+         *   status_code: "CREATED_SUCCESS",
+         *   data: ...
+         * }
+         */
+        analyzeResponseObject(object, file, context, depth);
+      }
 
       continue;
     }
 
     /*
-     * Shorthand:
+     * return someHelper(...)
      *
-     * {
-     *   user,
-     *   token
-     * }
+     * We need to follow the helper.
      */
-    const shorthandMatch = trimmed.match(/^([A-Za-z_$][\w$]*)$/);
+    const call = parseLeadingFunctionCall(value);
 
-    if (shorthandMatch) {
-      fields.push(shorthandMatch[1]);
+    if (call) {
+      resolveAndAnalyzeFunction(call.name, file, context, depth + 1);
+    }
+  }
+}
+
+function analyzeResponseObject(object, file, context, depth) {
+  if (!object) return;
+
+  /*
+   * Standard response:
+   *
+   * {
+   *   ok: true,
+   *   status: 201,
+   *   status_code: "CREATED_SUCCESS",
+   *   data: ...
+   * }
+   */
+  const status = extractLiteralNumber(object.properties.status);
+
+  const statusCode = extractLiteralString(object.properties.status_code);
+
+  const data = object.properties.data;
+
+  /*
+   * If this looks like a standard response, analyze data specifically.
+   */
+  if (data !== undefined) {
+    analyzeDataValue(data, file, context, depth + 1);
+  }
+
+  /*
+   * Even if there is no data, status information is useful.
+   */
+  if (status !== null || statusCode !== null) {
+    /*
+     * Successful response metadata is not put into errors.
+     */
+  }
+}
+
+function analyzeDataValue(value, file, context, depth, prefix = "") {
+  if (value === undefined || depth > context.maxDepth) {
+    return;
+  }
+
+  /*
+   * data: {
+   *   id: user.id,
+   *   profile: {
+   *     name: user.name
+   *   }
+   * }
+   */
+  if (value.type === "object") {
+    for (const [name, property] of Object.entries(value.properties)) {
+      if (name === "...") {
+        continue;
+      }
+
+      const fieldName = prefix ? `${prefix}.${name}` : name;
+
+      const field = inferValueField(property, fieldName);
+
+      mergeResponseField(context, field);
+
+      if (property.type === "object") {
+        analyzeDataValue(property, file, context, depth + 1, fieldName);
+      }
+
+      /*
+       * data: {
+       *   schedule: buildSchedule()
+       * }
+       */
+      if (property.type === "call") {
+        resolveAndAnalyzeFunction(property.name, file, context, depth + 1);
+      }
+    }
+
+    return;
+  }
+
+  /*
+   * data: someFunction()
+   */
+  if (value.type === "call") {
+    const fn = resolveFunction(value.name, file, context);
+
+    if (fn) {
+      /*
+       * Extract the helper's return object directly into data.
+       */
+      const returns = findReturnExpressions(fn.body);
+
+      for (const expression of returns) {
+        const returned = expression.expression.trim();
+
+        if (returned.startsWith("{")) {
+          const object = parseObjectLiteral(returned);
+
+          if (object) {
+            analyzeDataValue(
+              object,
+              file ?? fn.file,
+              context,
+              depth + 1,
+              prefix,
+            );
+          }
+        }
+
+        const nestedCall = parseLeadingFunctionCall(returned);
+
+        if (nestedCall) {
+          analyzeDataValue(
+            {
+              type: "call",
+              name: nestedCall.name,
+            },
+            fn.file,
+            context,
+            depth + 1,
+            prefix,
+          );
+        }
+      }
+    }
+
+    return;
+  }
+
+  /*
+   * data: variable
+   */
+  if (value.type === "identifier") {
+    const fn = resolveFunction(value.name, file, context);
+
+    if (fn) {
+      analyzeFunction(fn, context, depth + 1);
+
+      const returns = findReturnExpressions(fn.body);
+
+      for (const expression of returns) {
+        const returned = expression.expression.trim();
+
+        if (returned.startsWith("{")) {
+          const object = parseObjectLiteral(returned);
+
+          if (object) {
+            analyzeDataValue(object, fn.file, context, depth + 1, prefix);
+          }
+        }
+      }
+    }
+  }
+}
+
+function inferValueField(value, field) {
+  if (!value) {
+    return {
+      field,
+      type: "any",
+      description: null,
+    };
+  }
+
+  if (value.type === "string") {
+    return {
+      field,
+      type: "string",
+      description: null,
+    };
+  }
+
+  if (value.type === "number") {
+    return {
+      field,
+      type: "number",
+      description: null,
+    };
+  }
+
+  if (value.type === "boolean") {
+    return {
+      field,
+      type: "boolean",
+      description: null,
+    };
+  }
+
+  if (value.type === "null") {
+    return {
+      field,
+      type: "null",
+      description: null,
+    };
+  }
+
+  if (value.type === "array") {
+    return {
+      field,
+      type: "array",
+      description: null,
+    };
+  }
+
+  if (value.type === "object") {
+    return {
+      field,
+      type: "object",
+      description: null,
+    };
+  }
+
+  if (value.type === "call") {
+    return {
+      field,
+      type: "object",
+      description: null,
+    };
+  }
+
+  return {
+    field,
+    type: "any",
+    description: null,
+  };
+}
+
+function mergeResponseField(context, field) {
+  if (!field || !field.field) {
+    return;
+  }
+
+  const existing = context.responseFields.get(field.field);
+
+  if (!existing) {
+    context.responseFields.set(field.field, field);
+    return;
+  }
+
+  if (existing.type === "any" && field.type !== "any") {
+    existing.type = field.type;
+  }
+
+  if (!existing.description && field.description) {
+    existing.description = field.description;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ERRORS                                                                     */
+/* -------------------------------------------------------------------------- */
+
+function analyzeErrors(source, file, context) {
+  const returns = findReturnExpressions(source);
+
+  for (const expression of returns) {
+    const value = expression.expression.trim();
+
+    if (!value.startsWith("{")) {
+      continue;
+    }
+
+    const object = parseObjectLiteral(value);
+
+    if (!object) continue;
+
+    const status = extractLiteralNumber(object.properties.status);
+
+    const statusCode = extractLiteralString(object.properties.status_code);
+
+    const meaning =
+      extractLiteralString(object.properties.message) ??
+      extractLiteralString(object.properties.error) ??
+      extractLiteralString(object.properties.detail);
+
+    /*
+     * Only treat an explicit HTTP error status as an error.
+     */
+    if (status !== null && status >= 400) {
+      context.errors.push({
+        status,
+        status_code: statusCode,
+        meaning: meaning ?? "not specified",
+      });
     }
   }
 
-  return fields;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Error / response properties                                                */
-/* -------------------------------------------------------------------------- */
-
-function extractNumericProperty(source, property) {
-  const escaped = escapeRegExp(property);
-
-  const pattern = new RegExp(`\\b${escaped}\\s*:\\s*(-?\\d+)`);
-
-  const match = source.match(pattern);
-
-  if (!match) return null;
-
-  return Number(match[1]);
-}
-
-function extractStringProperty(source, property) {
-  const escaped = escapeRegExp(property);
-
-  const pattern = new RegExp(`\\b${escaped}\\s*:\\s*(['"\`])([\\s\\S]*?)\\1`);
-
-  const match = source.match(pattern);
-
-  if (!match) return null;
-
-  return unescapeSimpleString(match[2]);
-}
-
-function extractBooleanProperty(source, property) {
-  const escaped = escapeRegExp(property);
-
-  const pattern = new RegExp(`\\b${escaped}\\s*:\\s*(true|false)\\b`);
-
-  const match = source.match(pattern);
-
-  if (!match) return null;
-
-  return match[1] === "true";
-}
-
-function extractPropertyObject(source, property) {
-  const escaped = escapeRegExp(property);
-
-  const pattern = new RegExp(`\\b${escaped}\\s*:\\s*\\{`);
-
-  const match = pattern.exec(source);
-
-  if (!match) return null;
-
-  const openIndex = match.index + match[0].lastIndexOf("{");
-
-  const closeIndex = findMatchingClose(source, openIndex, "{", "}");
-
-  if (closeIndex === -1) return null;
-
-  return source.slice(openIndex + 1, closeIndex);
-}
-
-/* -------------------------------------------------------------------------- */
-/* External services                                                          */
-/* -------------------------------------------------------------------------- */
-
-function extractExternalServiceCalls(source) {
-  const services = [];
-  const varToService = {};
-
   /*
-   * Supports:
-   *
-   * const stripe = await services("stripe");
-   * let stripe = await services("stripe");
-   * var stripe = services("stripe");
+   * throw new Error("...")
    */
-  const serviceVarPattern =
-    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?services\s*\(\s*(['"`])([^'"`]+)\2\s*\)/g;
+  const throwRegex =
+    /\bthrow\s+new\s+[A-Za-z_$][\w$]*\s*\(\s*(["'`])([\s\S]*?)\1\s*\)/g;
 
   let match;
 
-  while ((match = serviceVarPattern.exec(source))) {
-    varToService[match[1]] = match[3];
+  while ((match = throwRegex.exec(source))) {
+    context.errors.push({
+      status: null,
+      status_code: null,
+      meaning: match[2],
+    });
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* EXTERNAL SERVICES                                                          */
+/* -------------------------------------------------------------------------- */
+
+function analyzeExternalServices(source, file, context) {
+  const serviceVariables = {};
+
+  /*
+   * const workflows = await services("workflows")
+   */
+  const serviceRegex =
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*await\s+services\s*\(\s*(["'`])([^"'`]+)\2\s*\)/g;
+
+  let match;
+
+  while ((match = serviceRegex.exec(source))) {
+    serviceVariables[match[1]] = match[3];
+  }
+
+  /*
+   * workflows.call("update_signal", {...})
+   */
+  const callRegex =
+    /\b([A-Za-z_$][\w$]*)\s*\.\s*call\s*\(\s*(["'`])([^"'`]+)\2([\s\S]*?)\)/g;
+
+  while ((match = callRegex.exec(source))) {
+    const variable = match[1];
+
+    const service = serviceVariables[variable];
+
+    if (!service) continue;
+
+    const method = match[3];
+
+    const rawArguments = match[4]?.trim();
+
+    context.externalServices.push({
+      service,
+      method,
+      context: buildServiceArgumentContext(rawArguments),
+    });
   }
 
   /*
    * Also support:
    *
-   * const service = await services("stripe");
-   *
-   * followed by:
-   *
-   * service.call("charges.create", {...})
+   * services("workflows").call(...)
    */
-  const callPattern = /\b([A-Za-z_$][\w$]*)\s*\.\s*call\s*\(/g;
+  const directRegex =
+    /\bservices\s*\(\s*(["'`])([^"'`]+)\1\s*\)\s*\.\s*call\s*\(\s*(["'`])([^"'`]+)\3([\s\S]*?)\)/g;
 
-  while ((match = callPattern.exec(source))) {
-    const variable = match[1];
-
-    const serviceName = varToService[variable];
-
-    if (!serviceName) continue;
-
-    const openParenIndex = source.indexOf("(", match.index);
-
-    if (openParenIndex === -1) continue;
-
-    const closeParenIndex = findMatchingClose(source, openParenIndex, "(", ")");
-
-    if (closeParenIndex === -1) continue;
-
-    const argumentsText = source.slice(openParenIndex + 1, closeParenIndex);
-
-    const args = splitTopLevelEntries(argumentsText);
-
-    const method = parseStringLiteral(args[0]);
-
-    if (!method) continue;
-
-    const context = buildServiceContext(args.slice(1));
-
-    services.push({
-      service: serviceName,
-      method,
-      context,
-      arguments: args.slice(1).map((arg) => arg.trim()),
+  while ((match = directRegex.exec(source))) {
+    context.externalServices.push({
+      service: match[2],
+      method: match[4],
+      context: buildServiceArgumentContext(match[5]?.trim()),
     });
-
-    callPattern.lastIndex = closeParenIndex + 1;
   }
-
-  /*
-   * Also support direct service calls:
-   *
-   * await services("stripe").call("charges.create", {...})
-   */
-  const directPattern =
-    /\b(?:await\s+)?services\s*\(\s*(['"`])([^'"`]+)\1\s*\)\s*\.\s*call\s*\(/g;
-
-  while ((match = directPattern.exec(source))) {
-    const serviceName = match[2];
-
-    const openParenIndex = source.indexOf("(", match.index);
-
-    if (openParenIndex === -1) continue;
-
-    const closeParenIndex = findMatchingClose(source, openParenIndex, "(", ")");
-
-    if (closeParenIndex === -1) continue;
-
-    const argumentsText = source.slice(openParenIndex + 1, closeParenIndex);
-
-    const args = splitTopLevelEntries(argumentsText);
-
-    const method = parseStringLiteral(args[0]);
-
-    if (!method) continue;
-
-    services.push({
-      service: serviceName,
-      method,
-      context: buildServiceContext(args.slice(1)),
-      arguments: args.slice(1).map((arg) => arg.trim()),
-    });
-
-    directPattern.lastIndex = closeParenIndex + 1;
-  }
-
-  return dedupeServices(services);
 }
 
-function buildServiceContext(args) {
-  if (!args || args.length === 0) {
+function buildServiceArgumentContext(raw) {
+  if (!raw) {
     return null;
   }
 
-  const meaningful = args.map((arg) => arg.trim()).filter(Boolean);
+  const cleaned = raw.trim();
 
-  if (meaningful.length === 0) {
+  if (!cleaned) {
     return null;
   }
-
-  const first = meaningful[0];
 
   /*
-   * Object argument:
-   *
-   * {
-   *   amount,
-   *   currency: "usd",
-   *   customer: user._id
-   * }
+   * Keep the documentation useful without dumping enormous implementation
+   * details into the generated page.
    */
-  if (first.startsWith("{")) {
-    const fields = extractObjectKeys(first.slice(1, first.lastIndexOf("}")));
+  const normalized = cleaned.replace(/\s+/g, " ").slice(0, 500);
 
-    if (fields.length) {
-      return `Arguments: ${fields.map((field) => `\`${field}\``).join(", ")}`;
+  return `Arguments: \`${normalized}\``;
+}
+
+/* -------------------------------------------------------------------------- */
+/* PARSING HELPERS                                                            */
+/* -------------------------------------------------------------------------- */
+
+function findReturnExpressions(source) {
+  const results = [];
+
+  const regex = /\breturn\b/g;
+
+  let match;
+
+  while ((match = regex.exec(source))) {
+    const start = skipWhitespaceAndComments(
+      source,
+      match.index + match[0].length,
+    );
+
+    const end = findExpressionEnd(source, start);
+
+    results.push({
+      start,
+      end,
+      expression: source.slice(start, end),
+    });
+
+    regex.lastIndex = end;
+  }
+
+  return results;
+}
+
+function extractFunctionCalls(source) {
+  const results = [];
+
+  const regex = /\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*\(/g;
+
+  let match;
+
+  while ((match = regex.exec(source))) {
+    const name = match[1];
+
+    /*
+     * Ignore obvious language/built-in constructs.
+     */
+    if (["if", "for", "while", "switch", "catch", "function"].includes(name)) {
+      continue;
+    }
+
+    results.push({
+      name,
+      index: match.index,
+    });
+  }
+
+  return results;
+}
+
+function parseLeadingFunctionCall(value) {
+  const match = value.match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*\(/);
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    name: match[1],
+  };
+}
+
+function resolveFunction(name, file, context) {
+  if (!name) {
+    return null;
+  }
+
+  const clean = name.includes(".") ? name.split(".").pop() : name;
+
+  const local = context.functions.get(`${file ?? "<inline>"}:${clean}`);
+
+  if (local) {
+    return local;
+  }
+
+  if (file) {
+    const alias = context.aliases.get(`${file}:${clean}`);
+
+    if (alias) {
+      const imported = context.functions.get(
+        `${alias.file}:${alias.importedName}`,
+      );
+
+      if (imported) {
+        return imported;
+      }
+
+      if (alias.importedName === "default") {
+        return (
+          [...context.functions.values()].find(
+            (fn) => fn.file === alias.file,
+          ) ?? null
+        );
+      }
     }
   }
 
-  /*
-   * Generic argument context.
-   */
-  return `Arguments: ${meaningful
-    .map((arg) => {
-      const shortened = arg.replace(/\s+/g, " ").trim();
+  const matches = [...context.functions.values()].filter(
+    (fn) => fn.name === clean,
+  );
 
-      return `\`${shortened}\``;
-    })
-    .join(", ")}`;
+  return matches.length === 1 ? matches[0] : null;
 }
 
-function dedupeServices(services) {
-  const seen = new Set();
-  const result = [];
+function parseObjectLiteral(text) {
+  const source = text.trim();
 
-  for (const service of services) {
-    const key = JSON.stringify({
-      service: service.service,
-      method: service.method,
-      context: service.context,
-    });
-
-    if (seen.has(key)) continue;
-
-    seen.add(key);
-    result.push(service);
+  if (!source.startsWith("{")) {
+    return null;
   }
 
-  return result;
+  const close = findMatchingClose(source, 0, "{", "}");
+
+  if (close === -1) {
+    return null;
+  }
+
+  const inside = source.slice(1, close);
+
+  const properties = {};
+
+  for (const part of splitTopLevel(inside, ",")) {
+    const property = parseObjectProperty(part);
+
+    if (!property) continue;
+
+    properties[property.name] = property.value;
+  }
+
+  return {
+    type: "object",
+    properties,
+  };
 }
 
-/* -------------------------------------------------------------------------- */
-/* String helpers                                                             */
-/* -------------------------------------------------------------------------- */
+function parseObjectProperty(text) {
+  const source = text.trim();
 
-function parseStringLiteral(text) {
-  if (!text) return null;
+  if (!source) return null;
 
-  const t = text.trim();
+  /*
+   * Spread.
+   */
+  if (source.startsWith("...")) {
+    return {
+      name: "...",
+      value: {
+        type: "spread",
+        name: source.slice(3).trim(),
+      },
+    };
+  }
 
-  if (t.length < 2) return null;
+  /*
+   * key: value
+   */
+  const colon = findTopLevelColon(source);
 
-  const first = t[0];
-  const last = t[t.length - 1];
+  if (colon !== -1) {
+    const rawName = source.slice(0, colon).trim();
 
-  if ((first === '"' || first === "'" || first === "`") && first === last) {
-    return unescapeSimpleString(t.slice(1, -1));
+    const rawValue = source.slice(colon + 1).trim();
+
+    const name = normalizePropertyName(rawName);
+
+    return {
+      name,
+      value: parseValue(rawValue),
+    };
+  }
+
+  /*
+   * shorthand:
+   *
+   * return { id, name }
+   */
+  const shorthand = source.match(/^[A-Za-z_$][\w$]*$/);
+
+  if (shorthand) {
+    return {
+      name: shorthand[0],
+      value: {
+        type: "identifier",
+        name: shorthand[0],
+      },
+    };
   }
 
   return null;
 }
 
-function unescapeSimpleString(value) {
-  return value
-    .replace(/\\(["'`\\])/g, "$1")
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\r")
-    .replace(/\\t/g, "\t");
+function parseValue(value) {
+  const text = value.trim();
+
+  if (!text) {
+    return {
+      type: "any",
+    };
+  }
+
+  if (text.startsWith("{")) {
+    return (
+      parseObjectLiteral(text) ?? {
+        type: "object",
+      }
+    );
+  }
+
+  if (text.startsWith("[")) {
+    return {
+      type: "array",
+    };
+  }
+
+  if (/^["'`]/.test(text)) {
+    const string = parseQuotedString(text);
+
+    return string !== null
+      ? {
+          type: "string",
+          value: string,
+        }
+      : {
+          type: "string",
+        };
+  }
+
+  if (/^-?\d+(?:\.\d+)?$/.test(text)) {
+    return {
+      type: "number",
+      value: Number(text),
+    };
+  }
+
+  if (text === "true") {
+    return {
+      type: "boolean",
+      value: true,
+    };
+  }
+
+  if (text === "false") {
+    return {
+      type: "boolean",
+      value: false,
+    };
+  }
+
+  if (text === "null") {
+    return {
+      type: "null",
+    };
+  }
+
+  const call = parseLeadingFunctionCall(text);
+
+  if (call) {
+    return {
+      type: "call",
+      name: call.name,
+    };
+  }
+
+  const identifier = text.match(/^([A-Za-z_$][\w$]*)$/);
+
+  if (identifier) {
+    return {
+      type: "identifier",
+      name: identifier[1],
+    };
+  }
+
+  return {
+    type: "any",
+  };
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function extractLiteralNumber(value) {
+  if (!value || value.type !== "number") {
+    return null;
+  }
+
+  return value.value;
+}
+
+function extractLiteralString(value) {
+  if (!value || value.type !== "string") {
+    return null;
+  }
+
+  return value.value;
+}
+
+function normalizePropertyName(name) {
+  const trimmed = name.trim();
+
+  const quoted = parseQuotedString(trimmed);
+
+  if (quoted !== null) {
+    return quoted;
+  }
+
+  return trimmed.replace(/^['"`]|['"`]$/g, "");
+}
+
+function parseQuotedString(text) {
+  if (!text) return null;
+
+  const t = text.trim();
+
+  if (t.length < 2) {
+    return null;
+  }
+
+  const first = t[0];
+
+  const last = t[t.length - 1];
+
+  if ((first === '"' || first === "'" || first === "`") && first === last) {
+    return t.slice(1, -1);
+  }
+
+  return null;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Balanced parsing                                                           */
+/* LEXICAL HELPERS                                                            */
 /* -------------------------------------------------------------------------- */
 
 function findMatchingClose(source, openIndex, openChar = "{", closeChar = "}") {
   let depth = 0;
   let inString = null;
+  let inRegex = false;
 
   for (let i = openIndex; i < source.length; i++) {
+    const ch = source[i];
+
+    const next = source[i + 1];
+
+    if (inString) {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+
+      if (ch === inString) {
+        inString = null;
+      }
+
+      continue;
+    }
+
+    if (inRegex) {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+
+      if (ch === "/") {
+        inRegex = false;
+      }
+
+      continue;
+    }
+
+    if (ch === "/" && next === "/") {
+      const end = source.indexOf("\n", i + 2);
+
+      if (end === -1) {
+        break;
+      }
+
+      i = end;
+      continue;
+    }
+
+    if (ch === "/" && next === "*") {
+      const end = source.indexOf("*/", i + 2);
+
+      if (end === -1) {
+        break;
+      }
+
+      i = end + 1;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inString = ch;
+      continue;
+    }
+
+    if (ch === openChar) {
+      depth++;
+      continue;
+    }
+
+    if (ch === closeChar) {
+      depth--;
+
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+
+  return -1;
+}
+
+function findNextCodeChar(source, start, wanted) {
+  let inString = null;
+
+  for (let i = start; i < source.length; i++) {
     const ch = source[i];
 
     if (inString) {
@@ -510,151 +1569,406 @@ function findMatchingClose(source, openIndex, openChar = "{", closeChar = "}") {
       continue;
     }
 
-    if (ch === "/" && source[i + 1] === "/") {
-      const end = source.indexOf("\n", i);
-
-      if (end === -1) break;
-
-      i = end;
-
-      continue;
-    }
-
-    if (ch === "/" && source[i + 1] === "*") {
-      const end = source.indexOf("*/", i + 2);
-
-      if (end === -1) break;
-
-      i = end + 1;
-
-      continue;
-    }
-
     if (ch === '"' || ch === "'" || ch === "`") {
       inString = ch;
       continue;
     }
 
-    if (ch === openChar) {
-      depth++;
-    }
-
-    if (ch === closeChar) {
-      depth--;
-
-      if (depth === 0) {
-        return i;
-      }
+    if (ch === wanted) {
+      return i;
     }
   }
 
   return -1;
 }
 
-function skipString(source, start) {
-  const quote = source[start];
+function findExpressionEnd(source, start) {
+  let brace = 0;
+  let bracket = 0;
+  let paren = 0;
+  let string = null;
 
-  let i = start + 1;
+  for (let i = start; i < source.length; i++) {
+    const ch = source[i];
 
-  while (i < source.length) {
-    if (source[i] === "\\") {
-      i += 2;
-      continue;
-    }
-
-    if (source[i] === quote) {
-      return i + 1;
-    }
-
-    i++;
-  }
-
-  return i;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Top-level splitting                                                        */
-/* -------------------------------------------------------------------------- */
-
-function splitTopLevelEntries(text) {
-  const entries = [];
-
-  let depth = 0;
-  let inString = null;
-  let current = "";
-
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-
-    if (inString) {
-      current += ch;
-
+    if (string) {
       if (ch === "\\") {
-        current += text[++i] ?? "";
+        i++;
         continue;
       }
 
-      if (ch === inString) {
-        inString = null;
+      if (ch === string) {
+        string = null;
       }
 
       continue;
     }
 
     if (ch === '"' || ch === "'" || ch === "`") {
-      inString = ch;
-      current += ch;
+      string = ch;
       continue;
     }
 
-    if (ch === "/" && text[i + 1] === "/") {
-      const end = text.indexOf("\n", i);
+    if (ch === "{") brace++;
+    if (ch === "}") {
+      if (brace > 0) brace--;
+    }
 
-      if (end === -1) {
-        current += text.slice(i);
-        break;
+    if (ch === "[") bracket++;
+    if (ch === "]") {
+      if (bracket > 0) bracket--;
+    }
+
+    if (ch === "(") paren++;
+    if (ch === ")") {
+      if (paren > 0) paren--;
+    }
+
+    if (
+      (ch === ";" || ch === "\n") &&
+      brace === 0 &&
+      bracket === 0 &&
+      paren === 0
+    ) {
+      return i;
+    }
+  }
+
+  return source.length;
+}
+
+function splitTopLevel(source, separator) {
+  const result = [];
+
+  let start = 0;
+
+  let brace = 0;
+  let bracket = 0;
+  let paren = 0;
+  let string = null;
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+
+    if (string) {
+      if (ch === "\\") {
+        i++;
+        continue;
       }
 
-      current += text.slice(i, end);
+      if (ch === string) {
+        string = null;
+      }
+
+      continue;
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      string = ch;
+      continue;
+    }
+
+    if (ch === "{") brace++;
+    if (ch === "}") brace--;
+
+    if (ch === "[") bracket++;
+    if (ch === "]") bracket--;
+
+    if (ch === "(") paren++;
+    if (ch === ")") paren--;
+
+    if (ch === separator && brace === 0 && bracket === 0 && paren === 0) {
+      result.push(source.slice(start, i));
+
+      start = i + 1;
+    }
+  }
+
+  result.push(source.slice(start));
+
+  return result;
+}
+
+function findTopLevelColon(source) {
+  let brace = 0;
+  let bracket = 0;
+  let paren = 0;
+  let string = null;
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+
+    if (string) {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+
+      if (ch === string) {
+        string = null;
+      }
+
+      continue;
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      string = ch;
+      continue;
+    }
+
+    if (ch === "{") brace++;
+    if (ch === "}") brace--;
+
+    if (ch === "[") bracket++;
+    if (ch === "]") bracket--;
+
+    if (ch === "(") paren++;
+    if (ch === ")") paren--;
+
+    if (ch === ":" && brace === 0 && bracket === 0 && paren === 0) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+function skipWhitespaceAndComments(source, start) {
+  let i = start;
+
+  while (i < source.length) {
+    while (/\s/.test(source[i] ?? "")) {
+      i++;
+    }
+
+    if (source[i] === "/" && source[i + 1] === "/") {
+      const end = source.indexOf("\n", i + 2);
+
+      if (end === -1) {
+        return source.length;
+      }
+
       i = end;
-
       continue;
     }
 
-    if (ch === "/" && text[i + 1] === "*") {
-      const end = text.indexOf("*/", i + 2);
+    if (source[i] === "/" && source[i + 1] === "*") {
+      const end = source.indexOf("*/", i + 2);
 
       if (end === -1) {
-        current += text.slice(i);
-        break;
+        return source.length;
       }
 
-      current += text.slice(i, end + 2);
-      i = end + 1;
+      i = end + 2;
+      continue;
+    }
+
+    break;
+  }
+
+  return i;
+}
+
+function stripSourceForScanning(source) {
+  /*
+   * We intentionally preserve strings because returned string literals
+   * such as:
+   *
+   * status_code: "CREATED_SUCCESS"
+   *
+   * are useful.
+   *
+   * Comments are removed separately by replacing their contents with
+   * whitespace, preserving indexes reasonably well.
+   */
+  let result = "";
+
+  let string = null;
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+
+    const next = source[i + 1];
+
+    if (string) {
+      result += ch;
+
+      if (ch === "\\") {
+        if (i + 1 < source.length) {
+          result += source[++i];
+        }
+
+        continue;
+      }
+
+      if (ch === string) {
+        string = null;
+      }
 
       continue;
     }
 
-    if (ch === "{" || ch === "(" || ch === "[") {
-      depth++;
-    }
-
-    if (ch === "}" || ch === ")" || ch === "]") {
-      depth--;
-    }
-
-    if (ch === "," && depth === 0) {
-      entries.push(current);
-      current = "";
+    if (ch === '"' || ch === "'" || ch === "`") {
+      string = ch;
+      result += ch;
       continue;
     }
 
-    current += ch;
+    if (ch === "/" && next === "/") {
+      result += "  ";
+
+      i += 2;
+
+      while (i < source.length && source[i] !== "\n") {
+        result += " ";
+        i++;
+      }
+
+      if (i < source.length) {
+        result += "\n";
+      }
+
+      continue;
+    }
+
+    if (ch === "/" && next === "*") {
+      result += "  ";
+
+      i += 2;
+
+      while (i < source.length) {
+        if (source[i] === "*" && source[i + 1] === "/") {
+          result += "  ";
+          i++;
+          break;
+        }
+
+        result += source[i] === "\n" ? "\n" : " ";
+
+        i++;
+      }
+
+      continue;
+    }
+
+    result += ch;
   }
 
-  if (current.trim()) {
-    entries.push(current);
+  return result;
+}
+
+/* -------------------------------------------------------------------------- */
+/* COMMENTS                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function extractLeadingComment(body) {
+  if (!body) {
+    return null;
   }
 
-  return entries;
+  const lineMatch = body.match(/^\s*\/\/\s*(.+?)(?:\r?\n|$)/);
+
+  if (lineMatch) {
+    return lineMatch[1].trim();
+  }
+
+  const blockMatch = body.match(/^\s*\/\*\*?([\s\S]*?)\*\//);
+
+  if (blockMatch) {
+    return blockMatch[1]
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^\s*\*\s?/, "").trim())
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  return null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* SORTING / DEDUPE                                                           */
+/* -------------------------------------------------------------------------- */
+
+function compareResponseFields(a, b) {
+  const depthA = String(a.field).split(".").length;
+
+  const depthB = String(b.field).split(".").length;
+
+  if (depthA !== depthB) {
+    return depthA - depthB;
+  }
+
+  return String(a.field).localeCompare(String(b.field));
+}
+
+function dedupeErrors(errors) {
+  const seen = new Set();
+  const result = [];
+
+  for (const error of errors) {
+    const key = JSON.stringify({
+      status: error.status ?? null,
+      status_code: error.status_code ?? null,
+      meaning: error.meaning ?? null,
+    });
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(error);
+  }
+
+  return result;
+}
+
+function dedupeExternalServices(services) {
+  const seen = new Set();
+  const result = [];
+
+  for (const service of services) {
+    const key = JSON.stringify(service);
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(service);
+  }
+
+  return result;
+}
+
+function findProjectRoot(file) {
+  let current = path.dirname(path.resolve(file));
+
+  /*
+   * Walk upwards until package.json.
+   */
+  for (;;) {
+    if (current === path.dirname(current)) {
+      break;
+    }
+
+    returnIfPackage: if (false) {
+      // intentionally unreachable
+    }
+
+    current = path.dirname(current);
+
+    break;
+  }
+
+  return process.cwd();
+}
+
+async function exists(target) {
+  try {
+    await fs.access(target);
+    return true;
+  } catch {
+    return false;
+  }
 }

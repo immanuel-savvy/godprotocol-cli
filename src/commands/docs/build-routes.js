@@ -8,103 +8,44 @@ const REQUIRED_RANK = { conditional: 2, "optional (group)": 1 };
 
 export async function buildRoutes(projectRoot, docsRoot) {
   const rawRoutes = await scanRouterFiles(projectRoot);
-
   const built = [];
 
   for (const route of rawRoutes) {
-    const request = buildRequestSchema(route.schemaRaw);
-
-    const handlerDetails = extractHandlerDetails(route.handler?.source ?? null);
-
-    /*
-     * The API/documentation group is determined by the file
-     * containing the imported handler.
-     *
-     * Example:
-     *
-     * import { create_chat_session } from "../handlers/chat.js"
-     *
-     * => API group: "chat"
-     */
-    const apiName = getHandlerApiName(route.handler?.file, route.handler?.name);
+    const handlerDetails = await extractHandlerDetails(
+      route.handler?.source ?? null,
+      {
+        handlerFile: route.handler?.file ?? null,
+        projectRoot,
+        maxFiles: 100,
+        maxFunctions: 500,
+        maxDepth: 20,
+      },
+    );
 
     built.push({
       name: route.name,
-
-      /*
-       * Keep the original router category for metadata/backwards
-       * compatibility, but use apiName for documentation grouping.
-       */
       category: route.category,
-
-      apiName,
-
       security: route.security,
-
       routeFile: route.routeFile,
-
       handler: route.handler,
-
-      request,
-
+      request: buildRequestSchema(route.schemaRaw),
       response: {
         ref: "StandardResponse",
         data: handlerDetails.responseDataFields,
       },
-
       externalServices: handlerDetails.externalServices,
-
       errors: handlerDetails.errors,
-
       purpose: handlerDetails.purpose,
     });
   }
 
-  /*
-   * Group routes by the handler import file rather than
-   * the router file.
-   */
-  const byApi = groupBy(built, "apiName");
+  // One Markdown page per handler source file.
+  await renderRouteFiles(built, docsRoot);
 
-  await renderRouteFiles(byApi, docsRoot);
-
-  await renderApiIndex(built, docsRoot);
-
+  // One machine-readable route index.
   await renderRoutesJson(built, docsRoot);
 
   return built;
-}
-
-function getHandlerApiName(handlerFile, handlerName = null) {
-  if (!handlerFile) {
-    return handlerName || "unresolved";
-  }
-
-  /*
-   * Example:
-   *
-   * /project/handlers/chat.js
-   *
-   * => chat
-   */
-  const basename = path.basename(handlerFile, path.extname(handlerFile));
-
-  /*
-   * Make common handler naming conventions cleaner.
-   *
-   * chat.handler.js -> chat
-   * chat.handlers.js -> chat
-   * chat.controller.js -> chat
-   * chat.controllers.js -> chat
-   */
-  return (
-    basename
-      .replace(/\.(handlers?|controllers?|controller)$/i, "")
-      .replace(/[-_]+/g, "-")
-      .trim() ||
-    handlerName ||
-    "default"
-  );
 }
 
 function buildRequestSchema(schemaRaw) {
@@ -167,50 +108,559 @@ function strongerRequired(current, incoming) {
     : current;
 }
 
-async function renderRouteFiles(byApi, docsRoot) {
+async function renderRouteFiles(built, docsRoot) {
   const apiDir = path.join(docsRoot, "api");
 
   await fs.mkdir(apiDir, { recursive: true });
 
   /*
-   * Remove previously generated API pages so stale pages
-   * don't remain after routes are moved between handler files.
+   * ------------------------------------------------------------
+   * 1. Remove previously generated API markdown files
+   * ------------------------------------------------------------
+   *
+   * This prevents stale files such as:
+   *
+   *   v3.md
+   *   workflows_router.md
+   *   unresolved.md
+   *
+   * from surviving between generations.
    */
-  const existingFiles = await fs.readdir(apiDir);
+  const existingApiFiles = await collectMarkdownFiles(apiDir);
 
-  for (const file of existingFiles) {
-    if (!file.endsWith(".md")) {
+  for (const relativeFile of existingApiFiles) {
+    const fullPath = path.join(apiDir, relativeFile);
+
+    try {
+      await fs.unlink(fullPath);
+    } catch (error) {
+      console.warn(`Failed to remove stale API document: ${fullPath}`, error);
+    }
+  }
+
+  /*
+   * ------------------------------------------------------------
+   * 2. Group routes by their ACTUAL HANDLER FILE
+   * ------------------------------------------------------------
+   *
+   * This is the important distinction:
+   *
+   *   route.routeFile   = router-v3.js
+   *
+   *   route.handler.file = createChatSession.js
+   *
+   * The second one determines the documentation filename.
+   */
+  const byHandlerFile = new Map();
+
+  for (const route of built) {
+    const handlerFile = route.handler?.file;
+
+    /*
+     * Unresolved handlers do not get documentation files.
+     *
+     * In particular, NEVER create:
+     *
+     *   unresolved.md
+     *   null.md
+     *   undefined.md
+     */
+    if (!handlerFile) {
+      console.warn(`Skipping unresolved handler documentation: ${route.name}`);
+
       continue;
     }
 
-    await fs.rm(path.join(apiDir, file), { force: true });
-  }
+    const normalizedHandlerFile = path.resolve(handlerFile);
 
-  for (const [apiName, routes] of Object.entries(byApi)) {
-    const lines = [
-      `# ${capitalize(apiName)} API`,
-      "",
-      `This API contains ${routes.length} route${routes.length === 1 ? "" : "s"} handled by \`${apiName}\`.`,
-      "",
-    ];
+    if (!(await exists(normalizedHandlerFile))) {
+      console.warn(`Skipping missing handler file: ${normalizedHandlerFile}`);
 
-    for (const route of routes) {
-      lines.push(renderRoute(route), "---", "");
+      continue;
     }
 
-    const filename = `${safeFileName(apiName)}.md`;
+    if (!byHandlerFile.has(normalizedHandlerFile)) {
+      byHandlerFile.set(normalizedHandlerFile, []);
+    }
 
-    await fs.writeFile(path.join(apiDir, filename), lines.join("\n"));
+    byHandlerFile.get(normalizedHandlerFile).push(route);
+  }
+
+  /*
+   * ------------------------------------------------------------
+   * 3. Generate one Markdown file per handler source file
+   * ------------------------------------------------------------
+   */
+  const generatedDocuments = [];
+
+  for (const [handlerFile, routes] of byHandlerFile.entries()) {
+    const originalFileName = path.basename(
+      handlerFile,
+      path.extname(handlerFile),
+    );
+
+    const fileName = sanitizeDocFileName(originalFileName);
+
+    if (!fileName) {
+      console.warn(
+        `Skipping handler with invalid documentation filename: ${handlerFile}`,
+      );
+
+      continue;
+    }
+
+    /*
+     * IMPORTANT:
+     *
+     * This is derived from handlerFile.
+     *
+     * Therefore:
+     *
+     * router-v3.js
+     *
+     * cannot accidentally become:
+     *
+     * v3.md
+     */
+    const outputPath = path.join(apiDir, `${fileName}.md`);
+
+    const lines = [`# ${capitalize(originalFileName)} API`, ""];
+
+    for (const route of routes) {
+      lines.push(`## ${route.name}`);
+      lines.push("");
+
+      if (route.purpose) {
+        lines.push(escapeMarkdownValue(route.purpose));
+        lines.push("");
+      }
+
+      /*
+       * Endpoint information
+       */
+      lines.push("### Endpoint");
+      lines.push("");
+
+      lines.push("| Property | Value |");
+      lines.push("| --- | --- |");
+
+      lines.push(
+        `| Method | \`${escapeMarkdownValue(route.method ?? "N/A")}\` |`,
+      );
+
+      lines.push(
+        `| Route | \`${escapeMarkdownValue(
+          route.path ?? route.name ?? "N/A",
+        )}\` |`,
+      );
+
+      lines.push(
+        `| Security | \`${escapeMarkdownValue(route.security ?? "none")}\` |`,
+      );
+
+      lines.push("");
+
+      /*
+       * Request
+       */
+      if (route.request) {
+        lines.push("### Request");
+        lines.push("");
+
+        lines.push(renderRequestTable(route.request));
+
+        lines.push("");
+      }
+
+      /*
+       * Response
+       */
+      if (route.response) {
+        lines.push("### Response");
+        lines.push("");
+
+        lines.push(
+          `Extends \`${escapeMarkdownValue(
+            route.response.ref ?? "StandardResponse",
+          )}\`.`,
+        );
+
+        lines.push("");
+
+        lines.push("| Field | Type | Description |");
+        lines.push("| --- | --- | --- |");
+        lines.push("| `ok` | `boolean` | Whether the request succeeded |");
+        lines.push(
+          "| `message` | `string` | Human-readable response message |",
+        );
+        lines.push("| `data` | `object` | Response payload (see below) |");
+
+        lines.push("");
+
+        lines.push("#### Response Data");
+        lines.push("");
+
+        lines.push(renderResponseDataTable(route.response.data));
+        lines.push("");
+      }
+
+      /*
+       * External services
+       */
+      if (
+        Array.isArray(route.externalServices) &&
+        route.externalServices.length > 0
+      ) {
+        lines.push("### External Services");
+        lines.push("");
+
+        lines.push("| Service | Details |");
+        lines.push("| --- | --- |");
+
+        for (const service of route.externalServices) {
+          if (typeof service === "string") {
+            lines.push(`| ${escapeMarkdownValue(service)} | |`);
+
+            continue;
+          }
+
+          lines.push(
+            `| ${escapeMarkdownValue(
+              service?.name ?? "Unknown",
+            )} | ${escapeMarkdownValue(service?.description ?? "")} |`,
+          );
+        }
+
+        lines.push("");
+      }
+
+      /*
+       * Errors
+       */
+      if (Array.isArray(route.errors) && route.errors.length > 0) {
+        lines.push("### Errors");
+        lines.push("");
+
+        lines.push("| Error | Description |");
+        lines.push("| --- | --- |");
+
+        for (const error of route.errors) {
+          if (typeof error === "string") {
+            lines.push(`| ${escapeMarkdownValue(error)} | |`);
+
+            continue;
+          }
+
+          lines.push(
+            `| ${escapeMarkdownValue(
+              error?.code ?? error?.name ?? "Error",
+            )} | ${escapeMarkdownValue(
+              error?.message ?? error?.description ?? "",
+            )} |`,
+          );
+        }
+
+        lines.push("");
+      }
+
+      /*
+       * Handler information
+       */
+      lines.push("### Handler");
+      lines.push("");
+
+      lines.push(`\`${handlerFile}\``);
+
+      lines.push("");
+
+      /*
+       * Separate multiple routes handled by the same function.
+       */
+      lines.push("---");
+      lines.push("");
+    }
+
+    await fs.writeFile(outputPath, `${lines.join("\n").trim()}\n`, "utf8");
+
+    generatedDocuments.push({
+      fileName,
+      title: capitalize(originalFileName),
+      path: outputPath,
+      routes,
+    });
+
+    console.log(
+      `Generated API document: ${path.relative(docsRoot, outputPath)}`,
+    );
+  }
+
+  /*
+   * ------------------------------------------------------------
+   * 4. ALWAYS generate api/index.md
+   * ------------------------------------------------------------
+   *
+   * sidebars.js expects this document.
+   */
+  const indexLines = [
+    "# API Reference",
+    "",
+    "This section contains the API documentation generated from the application's handler files.",
+    "",
+  ];
+
+  if (generatedDocuments.length === 0) {
+    indexLines.push("No resolved API handlers were found.", "");
+  } else {
+    indexLines.push(
+      "## Available APIs",
+      "",
+      "| API | Routes |",
+      "| --- | ---: |",
+    );
+
+    for (const document of generatedDocuments) {
+      const routeCount = document.routes.length;
+
+      indexLines.push(
+        `| [${escapeMarkdownValue(
+          document.title,
+        )}](/docs/api/${document.fileName}) | ${routeCount} |`,
+      );
+    }
+
+    indexLines.push("");
+  }
+
+  const indexPath = path.join(apiDir, "index.md");
+
+  await fs.writeFile(indexPath, `${indexLines.join("\n").trim()}\n`, "utf8");
+
+  console.log(`Generated API index: ${path.relative(docsRoot, indexPath)}`);
+}
+
+function renderResponseDataTable(fields) {
+  if (!Array.isArray(fields) || fields.length === 0) {
+    return "_No response `data` fields could be determined from this handler._";
+  }
+
+  const lines = ["| Field | Type | Description |", "| --- | --- | --- |"];
+
+  for (const field of fields) {
+    if (typeof field === "string") {
+      lines.push(`| \`${escapeMarkdownValue(field)}\` | — | — |`);
+      continue;
+    }
+
+    const name = field?.field ?? field?.name ?? "unknown";
+    const type = field?.type ?? "any";
+    const description = field?.description ?? "—";
+
+    lines.push(
+      `| \`${escapeMarkdownValue(name)}\` | \`${escapeMarkdownValue(
+        type,
+      )}\` | ${escapeMarkdownValue(description)} |`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
+function renderRequestTable(request) {
+  if (!request || !request.defined) {
+    return "_No schema defined for this route — request shape is unvalidated._";
+  }
+
+  const rows = mergeFieldsWithLogic(request.body ?? [], request.logic);
+
+  if (!rows || rows.length === 0) {
+    return "_No request fields could be determined for this route._";
+  }
+
+  const lines = [
+    "| Field | Type | Required | Description |",
+    "| --- | --- | --- | --- |",
+  ];
+
+  for (const row of rows) {
+    const field = row?.field ?? row?.name ?? "unknown";
+    const type = row?.type ?? "any";
+
+    const required =
+      row?.required === true
+        ? "Yes"
+        : row?.required
+          ? escapeMarkdownValue(row.required)
+          : "No";
+
+    const description = row?.description ?? row?.constraints ?? "";
+
+    lines.push(
+      `| \`${escapeMarkdownValue(field)}\` | \`${escapeMarkdownValue(
+        type,
+      )}\` | ${required} | ${escapeMarkdownValue(description)} |`,
+    );
+  }
+
+  return lines.join("\n");
+}
+/*
+ * ------------------------------------------------------------
+ * Markdown helpers
+ * ------------------------------------------------------------
+ */
+
+async function collectMarkdownFiles(dir, relativeDir = "") {
+  if (!(await exists(dir))) {
+    return [];
+  }
+
+  const entries = await fs.readdir(dir, {
+    withFileTypes: true,
+  });
+
+  const files = [];
+
+  for (const entry of entries) {
+    const absolutePath = path.join(dir, entry.name);
+
+    const relativePath = path.join(relativeDir, entry.name);
+
+    if (entry.isDirectory()) {
+      files.push(...(await collectMarkdownFiles(absolutePath, relativePath)));
+
+      continue;
+    }
+
+    if (entry.isFile() && /\.(md|mdx)$/i.test(entry.name)) {
+      files.push(relativePath);
+    }
+  }
+
+  return files;
+}
+
+function sanitizeDocFileName(value) {
+  return String(value ?? "")
+    .replace(/\.(md|mdx)$/i, "")
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+}
+
+function capitalize(value) {
+  return String(value ?? "")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function escapeMarkdownValue(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  if (typeof value === "object") {
+    try {
+      return escapeMarkdownValue(JSON.stringify(value));
+    } catch {
+      return "";
+    }
+  }
+
+  return String(value)
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ")
+    .replace(/\{/g, "\\{")
+    .replace(/\}/g, "\\}")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderObjectTable(object) {
+  const entries = Object.entries(object ?? {});
+
+  if (entries.length === 0) {
+    return ["| Property | Value |", "| --- | --- |", "| — | — |"].join("\n");
+  }
+
+  const lines = ["| Property | Value |", "| --- | --- |"];
+
+  for (const [key, value] of entries) {
+    lines.push(
+      `| \`${escapeMarkdownValue(key)}\` | ${escapeMarkdownValue(value)} |`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
+function renderSchemaTable(schema) {
+  if (!schema || typeof schema !== "object") {
+    return [
+      "| Property | Type | Required | Description |",
+      "| --- | --- | --- | --- |",
+      "| — | — | — | — |",
+    ].join("\n");
+  }
+
+  const properties =
+    schema.properties ??
+    schema.body?.properties ??
+    schema.data?.properties ??
+    {};
+
+  const entries = Object.entries(properties);
+
+  if (entries.length === 0) {
+    return [
+      "| Property | Type | Required | Description |",
+      "| --- | --- | --- | --- |",
+      "| — | — | — | — |",
+    ].join("\n");
+  }
+
+  const required = new Set(
+    Array.isArray(schema.required) ? schema.required : [],
+  );
+
+  const lines = [
+    "| Property | Type | Required | Description |",
+    "| --- | --- | --- | --- |",
+  ];
+
+  for (const [name, definition] of entries) {
+    const type =
+      definition?.type ?? (Array.isArray(definition?.enum) ? "enum" : "object");
+
+    const description = definition?.description ?? "";
+
+    lines.push(
+      `| \`${escapeMarkdownValue(name)}\` | \`${escapeMarkdownValue(
+        type,
+      )}\` | ${required.has(name) ? "Yes" : "No"} | ${escapeMarkdownValue(
+        description,
+      )} |`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
+async function exists(target) {
+  try {
+    await fs.access(target);
+    return true;
+  } catch {
+    return false;
   }
 }
 
-function safeFileName(value) {
-  return (
-    String(value)
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "default"
-  );
+function formatHandlerTitle(handlerName) {
+  if (!handlerName) return "Unresolved Handler";
+
+  return handlerName
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+    .replace(/\bApi\b/g, "API");
 }
 
 function renderBodySection(request) {
@@ -269,11 +719,36 @@ function renderLogicGroups(logic) {
   return lines;
 }
 
+function escapeMarkdown(value) {
+  return String(value).replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
 function renderResponseData(dataFields) {
   if (!dataFields || dataFields.length === 0) {
-    return "_No `data` fields observed in this handler's return statements._";
+    return "_No `data` fields could be determined from this handler or its local helper functions._";
   }
-  return `\`data\` fields: ${dataFields.map((f) => `\`${f}\``).join(", ")}`;
+
+  const lines = ["| Field | Type | Description |", "|---|---|---|"];
+
+  for (const field of dataFields) {
+    if (typeof field === "string") {
+      lines.push(`| \`${escapeMarkdown(field)}\` | — | — |`);
+
+      continue;
+    }
+
+    const name = field.field ?? field.name ?? "unknown";
+
+    const type = field.type ?? "any";
+
+    const description = field.description ?? "—";
+
+    lines.push(
+      `| \`${escapeMarkdown(name)}\` | ${escapeMarkdown(type)} | ${escapeMarkdown(description)} |`,
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function renderExternalServices(services) {
@@ -286,42 +761,31 @@ function renderExternalServices(services) {
     .join("\n");
 }
 
-async function renderApiIndex(routes, docsRoot) {
+async function renderApiIndex(handlerDocs, docsRoot) {
   const apiDir = path.join(docsRoot, "api");
-
-  await fs.mkdir(apiDir, { recursive: true });
-
-  const grouped = groupBy(routes, "apiName");
 
   const lines = [
     "# API Reference",
     "",
-    "APIs grouped by their handler module.",
+    "API documentation grouped by handler source file.",
     "",
-    "| API | Routes | Security | Handler File |",
-    "|---|---:|---|---|",
+    "| Handler | Routes | Category |",
+    "|---|---:|---|",
   ];
 
-  for (const [apiName, apiRoutes] of Object.entries(grouped)) {
-    const firstRoute = apiRoutes[0];
+  for (const doc of handlerDocs) {
+    const firstRoute = doc.routes[0];
 
-    const handlerFile = firstRoute.handler?.file
-      ? relFile(firstRoute.handler.file)
-      : "unresolved";
-
-    const securityValues = [
-      ...new Set(apiRoutes.map((route) => route.security).filter(Boolean)),
+    const categories = [
+      ...new Set(doc.routes.map((route) => route.category).filter(Boolean)),
     ];
 
-    const security =
-      securityValues.length > 0 ? securityValues.join(", ") : "none";
-
     lines.push(
-      `| [${apiName}](./${safeFileName(apiName)}.md) | ${apiRoutes.length} | ${security} | \`${handlerFile}\` |`,
+      `| [${doc.fileName}](./${doc.fileName}.md) | ${doc.routes.length} | ${categories.join(", ") || "—"} |`,
     );
   }
 
-  await fs.writeFile(path.join(apiDir, "index.md"), lines.join("\n"));
+  await fs.writeFile(path.join(apiDir, "index.md"), lines.join("\n"), "utf8");
 }
 
 function renderRoute(route) {
@@ -396,17 +860,6 @@ async function renderRoutesJson(routes, docsRoot) {
   );
 }
 
-function groupBy(items, key) {
-  return items.reduce((acc, item) => {
-    (acc[item[key]] ??= []).push(item);
-    return acc;
-  }, {});
-}
-
-function capitalize(str) {
-  return str.charAt(0).toUpperCase() + str.slice(1);
-}
-
 function relFile(file) {
   return file ? path.relative(process.cwd(), file) : "unresolved";
 }
@@ -462,4 +915,18 @@ function renderErrors(errors) {
   }
 
   return lines.join("\n");
+}
+
+function escapeMarkdownText(value) {
+  return String(value ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/`/g, "\\`")
+    .replace(/\{/g, "\\{")
+    .replace(/\}/g, "\\}");
+}
+
+function markdownCode(value, language = "") {
+  const text = String(value ?? "");
+
+  return [`\`\`\`${language}`, text.replace(/```/g, "``\\`"), "```"].join("\n");
 }
