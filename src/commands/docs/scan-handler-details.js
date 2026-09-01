@@ -42,6 +42,7 @@ export async function extractHandlerDetails(handlerBody, options = {}) {
       purpose: null,
       responseDataFields: [],
       errors: [],
+      successResponses: [],
       externalServices: [],
     };
   }
@@ -84,6 +85,7 @@ export async function extractHandlerDetails(handlerBody, options = {}) {
 
     responseFields: new Map(),
     errors: [],
+    successResponses: [],
     externalServices: [],
 
     currentFile: handlerFile,
@@ -156,6 +158,8 @@ export async function extractHandlerDetails(handlerBody, options = {}) {
     ),
 
     errors: dedupeErrors(context.errors),
+
+    successResponses: dedupeSuccessResponses(context.successResponses),
 
     externalServices: dedupeExternalServices(context.externalServices),
   };
@@ -765,9 +769,14 @@ function analyzeResponseObject(object, file, context, depth) {
    *   data: ...
    * }
    */
+  const okValue = object.properties.ok;
+  const literalOk = okValue?.type === "boolean" ? okValue.value : null;
+
   const status = extractLiteralNumber(object.properties.status);
 
   const statusCode = extractLiteralString(object.properties.status_code);
+
+  const message = extractLiteralString(object.properties.message);
 
   const data = object.properties.data;
 
@@ -779,12 +788,17 @@ function analyzeResponseObject(object, file, context, depth) {
   }
 
   /*
-   * Even if there is no data, status information is useful.
+   * Only record a success entry when `ok: true` is a literal boolean
+   * in the source. If `ok` is computed at runtime (e.g. `ok: res.ok`),
+   * we cannot determine success statically, so we skip it rather
+   * than guess. Error-status handling for `ok: false` is entirely
+   * separate — see analyzeErrors below.
    */
-  if (status !== null || statusCode !== null) {
-    /*
-     * Successful response metadata is not put into errors.
-     */
+  if (literalOk === true && (message !== null || statusCode !== null)) {
+    context.successResponses.push({
+      status_code: statusCode,
+      message,
+    });
   }
 }
 
@@ -1918,6 +1932,27 @@ function dedupeErrors(errors) {
 
     seen.add(key);
     result.push(error);
+  }
+
+  return result;
+}
+
+function dedupeSuccessResponses(entries) {
+  const seen = new Set();
+  const result = [];
+
+  for (const entry of entries) {
+    const key = JSON.stringify({
+      status_code: entry.status_code ?? null,
+      message: entry.message ?? null,
+    });
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(entry);
   }
 
   return result;

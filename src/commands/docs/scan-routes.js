@@ -58,6 +58,9 @@ export async function scanRouterFiles(projectRoot) {
         name,
         category,
         security: entry.security ?? null,
+        method: entry.method ?? null,
+        path: entry.path ?? null,
+        description: entry.description ?? null,
         schemaRaw: entry.schemaRaw ?? null,
         routeFile: fullPath,
         handler: resolved,
@@ -68,6 +71,32 @@ export async function scanRouterFiles(projectRoot) {
   console.log(`Found ${results.length} routes`);
 
   return results;
+}
+
+/*
+ * Extracts a top-level `description: "..."` from a route entry's body
+ * text. Deliberately splits on TOP-LEVEL commas first (via
+ * splitTopLevelEntries) rather than running a blind regex against the
+ * whole body — the body also contains a nested `schema` block whose
+ * individual fields each have their own `description`, and a blind
+ * match could grab one of those instead of the route's own.
+ */
+function extractTopLevelDescription(bodyText) {
+  const parts = splitTopLevelEntries(bodyText);
+
+  for (const part of parts) {
+    const trimmed = part.trim();
+
+    const match = trimmed.match(
+      /^description\s*:\s*(?:"([^"]+)"|'([^']+)'|`([^`]+)`)/,
+    );
+
+    if (match) {
+      return match[1] ?? match[2] ?? match[3];
+    }
+  }
+
+  return null;
 }
 
 function parseRouteEntries(text) {
@@ -124,6 +153,7 @@ function parseRouteEntries(text) {
      * handler: foo
      * handler: foo_bar
      * handler: $foo
+     * handler: handlers.foo
      */
     const handlerMatch = bodyText.match(
       /\bhandler\s*:\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)/,
@@ -137,6 +167,31 @@ function parseRouteEntries(text) {
     const securityMatch = bodyText.match(
       /\bsecurity\s*:\s*(?:"([^"]+)"|'([^']+)'|`([^`]+)`)/,
     );
+
+    /*
+     * method: "POST"
+     */
+    const methodMatch = bodyText.match(
+      /\bmethod\s*:\s*(?:"([^"]+)"|'([^']+)'|`([^`]+)`)/i,
+    );
+
+    /*
+     * path: "/mail/send"
+     * route: "/mail/send"
+     * url: "/mail/send"
+     */
+    const pathMatch = bodyText.match(
+      /\b(?:path|route|url)\s*:\s*(?:"([^"]+)"|'([^']+)'|`([^`]+)`)/i,
+    );
+
+    /*
+     * description: "..."
+     *
+     * Extracted separately at the top level of bodyText, not via
+     * a blind regex, so nested schema-field descriptions are never
+     * mistaken for the route's own description.
+     */
+    const description = extractTopLevelDescription(bodyText);
 
     /*
      * schema: {
@@ -155,6 +210,14 @@ function parseRouteEntries(text) {
         security: securityMatch
           ? (securityMatch[1] ?? securityMatch[2] ?? securityMatch[3])
           : null,
+
+        method: methodMatch
+          ? (methodMatch[1] ?? methodMatch[2] ?? methodMatch[3]).toUpperCase()
+          : null,
+
+        path: pathMatch ? (pathMatch[1] ?? pathMatch[2] ?? pathMatch[3]) : null,
+
+        description: description ?? null,
 
         schemaRaw: schemaBlock?.raw ?? null,
       },

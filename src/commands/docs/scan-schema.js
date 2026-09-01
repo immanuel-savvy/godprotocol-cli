@@ -38,6 +38,7 @@ export function describeSchemaSection(sectionRules, pathPrefix = "") {
       pattern: rule.pattern ? String(rule.pattern) : null,
       constraints: describeConstraints(rule),
       validator: rule.validator ?? null,
+      description: rule.description ?? null,
     });
     if (rule.type === "object" && rule.schema) {
       fields.push(...describeSchemaSection(rule.schema, fullPath).fields);

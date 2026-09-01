@@ -26,16 +26,24 @@ export async function buildRoutes(projectRoot, docsRoot) {
       name: route.name,
       category: route.category,
       security: route.security,
+      method: route.method ?? null,
+      path: route.path ?? null,
       routeFile: route.routeFile,
       handler: route.handler,
       request: buildRequestSchema(route.schemaRaw),
       response: {
         ref: "StandardResponse",
         data: handlerDetails.responseDataFields,
+        success: handlerDetails.successResponses,
       },
       externalServices: handlerDetails.externalServices,
       errors: handlerDetails.errors,
-      purpose: handlerDetails.purpose,
+      /*
+       * An explicit `description:` written on the route entry is
+       * authoritative and takes priority over a leading-comment
+       * inference from the handler source.
+       */
+      purpose: route.description ?? handlerDetails.purpose,
     });
   }
 
@@ -50,24 +58,59 @@ export async function buildRoutes(projectRoot, docsRoot) {
 
 function buildRequestSchema(schemaRaw) {
   if (!schemaRaw) {
-    return { defined: false, body: [], logic: null, confidence: "extracted" };
+    return {
+      defined: false,
+      body: [],
+      logic: null,
+      query: [],
+      queryLogic: null,
+      params: [],
+      paramsLogic: null,
+      confidence: "extracted",
+    };
   }
+
   const evaluated = evaluateSchema(schemaRaw);
+
   if (!evaluated.ok) {
     return {
       defined: false,
       body: [],
       logic: null,
+      query: [],
+      queryLogic: null,
+      params: [],
+      paramsLogic: null,
       confidence: "extracted",
       evalError: evaluated.error,
     };
   }
+
   const bodyRules = evaluated.value.body ?? {};
-  const { fields, logic } = describeSchemaSection(bodyRules);
+  const queryRules = evaluated.value.query ?? {};
+  const paramsRules = evaluated.value.params ?? {};
+
+  const { fields: bodyFields, logic: bodyLogic } =
+    describeSchemaSection(bodyRules);
+  const { fields: queryFields, logic: queryLogic } =
+    describeSchemaSection(queryRules);
+  const { fields: paramsFields, logic: paramsLogic } =
+    describeSchemaSection(paramsRules);
+
   return {
-    defined: fields.length > 0 || !!logic,
-    body: fields,
-    logic,
+    defined:
+      bodyFields.length > 0 ||
+      !!bodyLogic ||
+      queryFields.length > 0 ||
+      !!queryLogic ||
+      paramsFields.length > 0 ||
+      !!paramsLogic,
+    body: bodyFields,
+    logic: bodyLogic,
+    query: queryFields,
+    queryLogic,
+    params: paramsFields,
+    paramsLogic,
     confidence: "extracted",
   };
 }
@@ -76,12 +119,18 @@ export function mergeFieldsWithLogic(fields, logic) {
   const byName = new Map(
     fields.map((f) => [f.field, { ...f, required: f.required ? true : false }]),
   );
-  const markGroup = (properties, type, required) => {
+
+  const markGroup = (properties, type, required, description) => {
     const label = required ? "conditional" : "optional (group)";
+
     for (const prop of properties) {
       if (byName.has(prop)) {
         const existing = byName.get(prop);
         existing.required = strongerRequired(existing.required, label);
+
+        if (!existing.description && description) {
+          existing.description = description;
+        }
       } else {
         byName.set(prop, {
           field: prop,
@@ -89,14 +138,23 @@ export function mergeFieldsWithLogic(fields, logic) {
           required: label,
           constraints: null,
           enum: null,
+          default: undefined,
+          description: description ?? null,
         });
       }
     }
   };
+
   if (logic?.or)
-    logic.or.forEach((g) => markGroup(g.properties, g.type, !!g.required));
+    logic.or.forEach((g) =>
+      markGroup(g.properties, g.type, !!g.required, g.description ?? null),
+    );
+
   if (logic?.and)
-    logic.and.forEach((g) => markGroup(g.properties, g.type, !!g.required));
+    logic.and.forEach((g) =>
+      markGroup(g.properties, g.type, !!g.required, g.description ?? null),
+    );
+
   return [...byName.values()];
 }
 
@@ -108,23 +166,21 @@ function strongerRequired(current, incoming) {
     : current;
 }
 
+/*
+ * ------------------------------------------------------------
+ * Handler-file document rendering
+ * ------------------------------------------------------------
+ */
+
 async function renderRouteFiles(built, docsRoot) {
   const apiDir = path.join(docsRoot, "api");
 
   await fs.mkdir(apiDir, { recursive: true });
 
   /*
-   * ------------------------------------------------------------
-   * 1. Remove previously generated API markdown files
-   * ------------------------------------------------------------
-   *
-   * This prevents stale files such as:
-   *
-   *   v3.md
-   *   workflows_router.md
-   *   unresolved.md
-   *
-   * from surviving between generations.
+   * Remove previously generated API markdown files, so stale
+   * pages (v3.md, workflows_router.md, unresolved.md, etc.)
+   * can never survive between generations.
    */
   const existingApiFiles = await collectMarkdownFiles(apiDir);
 
@@ -139,35 +195,15 @@ async function renderRouteFiles(built, docsRoot) {
   }
 
   /*
-   * ------------------------------------------------------------
-   * 2. Group routes by their ACTUAL HANDLER FILE
-   * ------------------------------------------------------------
-   *
-   * This is the important distinction:
-   *
-   *   route.routeFile   = router-v3.js
-   *
-   *   route.handler.file = createChatSession.js
-   *
-   * The second one determines the documentation filename.
+   * Group routes by their ACTUAL HANDLER FILE, not their route file.
    */
   const byHandlerFile = new Map();
 
   for (const route of built) {
     const handlerFile = route.handler?.file;
 
-    /*
-     * Unresolved handlers do not get documentation files.
-     *
-     * In particular, NEVER create:
-     *
-     *   unresolved.md
-     *   null.md
-     *   undefined.md
-     */
     if (!handlerFile) {
       console.warn(`Skipping unresolved handler documentation: ${route.name}`);
-
       continue;
     }
 
@@ -175,7 +211,6 @@ async function renderRouteFiles(built, docsRoot) {
 
     if (!(await exists(normalizedHandlerFile))) {
       console.warn(`Skipping missing handler file: ${normalizedHandlerFile}`);
-
       continue;
     }
 
@@ -187,9 +222,7 @@ async function renderRouteFiles(built, docsRoot) {
   }
 
   /*
-   * ------------------------------------------------------------
-   * 3. Generate one Markdown file per handler source file
-   * ------------------------------------------------------------
+   * Generate one Markdown file per handler source file.
    */
   const generatedDocuments = [];
 
@@ -198,186 +231,116 @@ async function renderRouteFiles(built, docsRoot) {
       handlerFile,
       path.extname(handlerFile),
     );
-
     const fileName = sanitizeDocFileName(originalFileName);
 
     if (!fileName) {
       console.warn(
         `Skipping handler with invalid documentation filename: ${handlerFile}`,
       );
-
       continue;
     }
 
-    /*
-     * IMPORTANT:
-     *
-     * This is derived from handlerFile.
-     *
-     * Therefore:
-     *
-     * router-v3.js
-     *
-     * cannot accidentally become:
-     *
-     * v3.md
-     */
     const outputPath = path.join(apiDir, `${fileName}.md`);
-
     const lines = [`# ${capitalize(originalFileName)} API`, ""];
 
+    const filePurpose = routes.map((r) => r.purpose).find(Boolean);
+    lines.push(
+      filePurpose
+        ? escapeMarkdownValue(filePurpose)
+        : "_No description was provided for this handler._",
+    );
+    lines.push("");
+
+    lines.push("## Routes", "");
+
+    /*
+     * One pass per route: heading, endpoint line (when known),
+     * purpose, then full detail directly beneath it.
+     */
     for (const route of routes) {
-      lines.push(`## ${route.name}`);
-      lines.push("");
-
-      if (route.purpose) {
-        lines.push(escapeMarkdownValue(route.purpose));
-        lines.push("");
-      }
+      lines.push(`### ${route.name}`, "");
 
       /*
-       * Endpoint information
+       * Only render an endpoint line when we actually have method
+       * and/or path data. This codebase dispatches routes by action
+       * name, not HTTP method + path, so for most handlers there is
+       * nothing to show here — omit rather than print "N/A N/A".
        */
-      lines.push("### Endpoint");
-      lines.push("");
-
-      lines.push("| Property | Value |");
-      lines.push("| --- | --- |");
-
-      lines.push(
-        `| Method | \`${escapeMarkdownValue(route.method ?? "N/A")}\` |`,
-      );
-
-      lines.push(
-        `| Route | \`${escapeMarkdownValue(
-          route.path ?? route.name ?? "N/A",
-        )}\` |`,
-      );
-
-      lines.push(
-        `| Security | \`${escapeMarkdownValue(route.security ?? "none")}\` |`,
-      );
-
-      lines.push("");
-
-      /*
-       * Request
-       */
-      if (route.request) {
-        lines.push("### Request");
-        lines.push("");
-
-        lines.push(renderRequestTable(route.request));
-
-        lines.push("");
-      }
-
-      /*
-       * Response
-       */
-      if (route.response) {
-        lines.push("### Response");
-        lines.push("");
-
+      if (route.method || route.path) {
         lines.push(
-          `Extends \`${escapeMarkdownValue(
-            route.response.ref ?? "StandardResponse",
-          )}\`.`,
+          `${escapeMarkdownValue(route.method ?? "")} ${escapeMarkdownValue(
+            route.path ?? "",
+          )}`.trim(),
         );
-
-        lines.push("");
-
-        lines.push("| Field | Type | Description |");
-        lines.push("| --- | --- | --- |");
-        lines.push("| `ok` | `boolean` | Whether the request succeeded |");
-        lines.push(
-          "| `message` | `string` | Human-readable response message |",
-        );
-        lines.push("| `data` | `object` | Response payload (see below) |");
-
-        lines.push("");
-
-        lines.push("#### Response Data");
-        lines.push("");
-
-        lines.push(renderResponseDataTable(route.response.data));
         lines.push("");
       }
 
-      /*
-       * External services
-       */
-      if (
-        Array.isArray(route.externalServices) &&
-        route.externalServices.length > 0
-      ) {
-        lines.push("### External Services");
-        lines.push("");
+      lines.push(
+        route.purpose
+          ? escapeMarkdownValue(route.purpose)
+          : "_No description available._",
+      );
+      lines.push("");
 
-        lines.push("| Service | Details |");
-        lines.push("| --- | --- |");
+      lines.push("#### Authentication", "");
+      lines.push(describeAuthentication(route.security));
+      lines.push("");
 
-        for (const service of route.externalServices) {
-          if (typeof service === "string") {
-            lines.push(`| ${escapeMarkdownValue(service)} | |`);
+      lines.push("#### Request", "");
+      lines.push(renderRequestSection(route.request));
+      lines.push("");
 
-            continue;
-          }
+      lines.push("#### Response", "");
+      lines.push(
+        "Returns the [standard response envelope](../api/#standard-response).",
+      );
+      lines.push("");
 
+      const successEntries = route.response?.success ?? [];
+
+      if (successEntries.length > 0) {
+        lines.push("| Status Code | Message |", "| --- | --- |");
+
+        for (const entry of successEntries) {
           lines.push(
-            `| ${escapeMarkdownValue(
-              service?.name ?? "Unknown",
-            )} | ${escapeMarkdownValue(service?.description ?? "")} |`,
-          );
-        }
-
-        lines.push("");
-      }
-
-      /*
-       * Errors
-       */
-      if (Array.isArray(route.errors) && route.errors.length > 0) {
-        lines.push("### Errors");
-        lines.push("");
-
-        lines.push("| Error | Description |");
-        lines.push("| --- | --- |");
-
-        for (const error of route.errors) {
-          if (typeof error === "string") {
-            lines.push(`| ${escapeMarkdownValue(error)} | |`);
-
-            continue;
-          }
-
-          lines.push(
-            `| ${escapeMarkdownValue(
-              error?.code ?? error?.name ?? "Error",
-            )} | ${escapeMarkdownValue(
-              error?.message ?? error?.description ?? "",
+            `| ${escapeMarkdownValue(entry.status_code ?? "—")} | ${escapeMarkdownValue(
+              entry.message ?? "—",
             )} |`,
           );
         }
 
         lines.push("");
+      } else {
+        lines.push(
+          "_No specific success status code or message could be determined for this route._",
+        );
+        lines.push("");
       }
 
-      /*
-       * Handler information
-       */
-      lines.push("### Handler");
-      lines.push("");
+      const responseFields = route.response?.data ?? [];
 
-      lines.push(`\`${handlerFile}\``);
+      if (responseFields.length > 0) {
+        lines.push("##### Data", "");
+        lines.push(renderResponseDataTable(responseFields));
+        lines.push("");
+      }
 
-      lines.push("");
+      if (
+        Array.isArray(route.externalServices) &&
+        route.externalServices.length > 0
+      ) {
+        lines.push("#### External Dependencies", "");
+        lines.push(renderExternalDependenciesTable(route.externalServices));
+        lines.push("");
+      }
 
-      /*
-       * Separate multiple routes handled by the same function.
-       */
-      lines.push("---");
-      lines.push("");
+      if (Array.isArray(route.errors) && route.errors.length > 0) {
+        lines.push("#### Errors", "");
+        lines.push(renderErrorsTable(route.errors));
+        lines.push("");
+      }
+
+      lines.push("---", "");
     }
 
     await fs.writeFile(outputPath, `${lines.join("\n").trim()}\n`, "utf8");
@@ -395,54 +358,198 @@ async function renderRouteFiles(built, docsRoot) {
   }
 
   /*
-   * ------------------------------------------------------------
-   * 4. ALWAYS generate api/index.md
-   * ------------------------------------------------------------
-   *
-   * sidebars.js expects this document.
+   * ALWAYS generate api/index.md — sidebars.js links its category to it.
    */
   const indexLines = [
     "# API Reference",
     "",
     "This section contains the API documentation generated from the application's handler files.",
     "",
+    "## Standard Response",
+    "",
+    "All handlers return this envelope.",
+    "",
+    "| Field | Type | Notes |",
+    "| --- | --- | --- |",
+    "| `ok` | `boolean` | |",
+    "| `message` | `string` | |",
+    "| `data` | `object \\| null` | |",
+    "| `status_code` | `string` | Optional — not every response includes it |",
+    "",
+    "## Handlers",
+    "",
   ];
 
   if (generatedDocuments.length === 0) {
-    indexLines.push("No resolved API handlers were found.", "");
+    indexLines.push("_No resolved API handlers were found._", "");
   } else {
-    indexLines.push(
-      "## Available APIs",
-      "",
-      "| API | Routes |",
-      "| --- | ---: |",
-    );
-
     for (const document of generatedDocuments) {
-      const routeCount = document.routes.length;
-
       indexLines.push(
-        `| [${escapeMarkdownValue(
-          document.title,
-        )}](/docs/api/${document.fileName}) | ${routeCount} |`,
+        `- [${escapeMarkdownValue(document.title)}](/docs/api/${document.fileName})`,
       );
     }
-
     indexLines.push("");
   }
 
   const indexPath = path.join(apiDir, "index.md");
-
   await fs.writeFile(indexPath, `${indexLines.join("\n").trim()}\n`, "utf8");
-
   console.log(`Generated API index: ${path.relative(docsRoot, indexPath)}`);
 }
 
-function renderResponseDataTable(fields) {
-  if (!Array.isArray(fields) || fields.length === 0) {
-    return "_No response `data` fields could be determined from this handler._";
+/*
+ * Maps the raw `security` value from the route scanner to a display
+ * label. Falls back to the raw value when it doesn't match a known
+ * pattern, rather than guessing.
+ */
+function describeAuthentication(security) {
+  if (!security) {
+    return "None";
   }
 
+  const value = String(security).trim();
+
+  if (!value || /^none$/i.test(value)) {
+    return "None";
+  }
+
+  if (/api[-_ ]?key/i.test(value)) {
+    return "**API Key** — _see the Authentication guide (not yet published)._";
+  }
+
+  if (/bearer|jwt|token|auth/i.test(value)) {
+    return "**Bearer Token** — _see the Authentication guide (not yet published)._";
+  }
+
+  return escapeMarkdownValue(value);
+}
+
+function renderRequestSection(request) {
+  if (!request || !request.defined) {
+    return "_No schema defined for this route — request shape is unvalidated._";
+  }
+
+  const hasParams =
+    (Array.isArray(request.params) && request.params.length > 0) ||
+    !!request.paramsLogic;
+
+  const hasQuery =
+    (Array.isArray(request.query) && request.query.length > 0) ||
+    !!request.queryLogic;
+
+  const parts = [];
+
+  if (hasParams) {
+    parts.push("**Path Parameters**", "");
+    parts.push(
+      renderFieldTable(
+        mergeFieldsWithLogic(request.params ?? [], request.paramsLogic),
+      ),
+    );
+    parts.push("");
+  }
+
+  if (hasQuery) {
+    parts.push("**Query Parameters**", "");
+    parts.push(
+      renderFieldTable(
+        mergeFieldsWithLogic(request.query ?? [], request.queryLogic),
+      ),
+    );
+    parts.push("");
+  }
+
+  if (hasParams || hasQuery) {
+    parts.push("**Body**", "");
+  }
+
+  parts.push(
+    renderFieldTable(mergeFieldsWithLogic(request.body ?? [], request.logic)),
+  );
+
+  return parts.join("\n").trim();
+}
+
+function renderFieldTable(rows) {
+  if (!rows || rows.length === 0) {
+    return "_No fields could be determined for this section._";
+  }
+
+  const lines = [
+    "| Field | Type | Required | Description |",
+    "| --- | --- | --- | --- |",
+  ];
+
+  for (const row of rows) {
+    const field = row?.field ?? row?.name ?? "unknown";
+    const type = row?.type ?? "any";
+
+    const required =
+      row?.required === true
+        ? "Yes"
+        : row?.required
+          ? escapeMarkdownValue(row.required)
+          : "No";
+
+    const description = describeFieldMeta(row);
+
+    lines.push(
+      `| \`${escapeMarkdownValue(field)}\` | \`${escapeMarkdownValue(
+        type,
+      )}\` | ${required} | ${escapeMarkdownValue(description)} |`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
+/*
+ * Builds the Description-column text for a request field: leads with
+ * the human-written `description` (falling back to any inferred
+ * validation `constraints` when no description was given), then
+ * appends `enum` and `default_value` as additional info whenever the
+ * schema defines them, regardless of whether a description exists.
+ */
+function describeFieldMeta(row) {
+  const segments = [];
+
+  if (row?.description) {
+    segments.push(row.description);
+  } else if (row?.constraints) {
+    segments.push(row.constraints);
+  }
+
+  if (Array.isArray(row?.enum) && row.enum.length > 0) {
+    segments.push(`Allowed: ${row.enum.join(", ")}`);
+  }
+
+  if (
+    row?.default !== undefined &&
+    row?.default !== null &&
+    row?.default !== ""
+  ) {
+    segments.push(`Default: ${formatDefaultValue(row.default)}`);
+  }
+
+  return segments.length > 0 ? segments.join(" — ") : "";
+}
+
+function formatDefaultValue(value) {
+  if (typeof value === "string") {
+    return `\`${value}\``;
+  }
+
+  if (typeof value === "object") {
+    try {
+      return `\`${JSON.stringify(value)}\``;
+    } catch {
+      return "—";
+    }
+  }
+
+  return `\`${value}\``;
+}
+
+function renderResponseDataTable(fields) {
   const lines = ["| Field | Type | Description |", "| --- | --- | --- |"];
 
   for (const field of fields) {
@@ -465,47 +572,56 @@ function renderResponseDataTable(fields) {
   return lines.join("\n");
 }
 
-function renderRequestTable(request) {
-  if (!request || !request.defined) {
-    return "_No schema defined for this route — request shape is unvalidated._";
-  }
+function renderExternalDependenciesTable(services) {
+  const lines = ["| Service | Operation | Purpose |", "| --- | --- | --- |"];
 
-  const rows = mergeFieldsWithLogic(request.body ?? [], request.logic);
+  for (const service of services) {
+    if (typeof service === "string") {
+      lines.push(`| ${escapeMarkdownValue(service)} | — | — |`);
+      continue;
+    }
 
-  if (!rows || rows.length === 0) {
-    return "_No request fields could be determined for this route._";
-  }
-
-  const lines = [
-    "| Field | Type | Required | Description |",
-    "| --- | --- | --- | --- |",
-  ];
-
-  for (const row of rows) {
-    const field = row?.field ?? row?.name ?? "unknown";
-    const type = row?.type ?? "any";
-
-    const required =
-      row?.required === true
-        ? "Yes"
-        : row?.required
-          ? escapeMarkdownValue(row.required)
-          : "No";
-
-    const description = row?.description ?? row?.constraints ?? "";
+    const name = service?.service ?? service?.name ?? "Unknown";
+    const operation = service?.method ?? "—";
+    const purpose = service?.context ?? "—";
 
     lines.push(
-      `| \`${escapeMarkdownValue(field)}\` | \`${escapeMarkdownValue(
-        type,
-      )}\` | ${required} | ${escapeMarkdownValue(description)} |`,
+      `| ${escapeMarkdownValue(name)} | ${escapeMarkdownValue(
+        operation,
+      )} | ${escapeMarkdownValue(purpose)} |`,
     );
   }
 
   return lines.join("\n");
 }
+
+function renderErrorsTable(errors) {
+  const lines = ["| Status | Code | Description |", "| --- | --- | --- |"];
+
+  for (const error of errors) {
+    if (typeof error === "string") {
+      lines.push(`| — | — | ${escapeMarkdownValue(error)} |`);
+      continue;
+    }
+
+    const status = error?.status ?? "—";
+    const code = error?.status_code ?? error?.code ?? "—";
+    const description =
+      error?.meaning ?? error?.message ?? error?.description ?? "—";
+
+    lines.push(
+      `| ${escapeMarkdownValue(status)} | ${escapeMarkdownValue(
+        code,
+      )} | ${escapeMarkdownValue(description)} |`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
 /*
  * ------------------------------------------------------------
- * Markdown helpers
+ * Shared helpers
  * ------------------------------------------------------------
  */
 
@@ -514,20 +630,15 @@ async function collectMarkdownFiles(dir, relativeDir = "") {
     return [];
   }
 
-  const entries = await fs.readdir(dir, {
-    withFileTypes: true,
-  });
-
+  const entries = await fs.readdir(dir, { withFileTypes: true });
   const files = [];
 
   for (const entry of entries) {
     const absolutePath = path.join(dir, entry.name);
-
     const relativePath = path.join(relativeDir, entry.name);
 
     if (entry.isDirectory()) {
       files.push(...(await collectMarkdownFiles(absolutePath, relativePath)));
-
       continue;
     }
 
@@ -575,76 +686,6 @@ function escapeMarkdownValue(value) {
     .replace(/>/g, "&gt;");
 }
 
-function renderObjectTable(object) {
-  const entries = Object.entries(object ?? {});
-
-  if (entries.length === 0) {
-    return ["| Property | Value |", "| --- | --- |", "| — | — |"].join("\n");
-  }
-
-  const lines = ["| Property | Value |", "| --- | --- |"];
-
-  for (const [key, value] of entries) {
-    lines.push(
-      `| \`${escapeMarkdownValue(key)}\` | ${escapeMarkdownValue(value)} |`,
-    );
-  }
-
-  return lines.join("\n");
-}
-
-function renderSchemaTable(schema) {
-  if (!schema || typeof schema !== "object") {
-    return [
-      "| Property | Type | Required | Description |",
-      "| --- | --- | --- | --- |",
-      "| — | — | — | — |",
-    ].join("\n");
-  }
-
-  const properties =
-    schema.properties ??
-    schema.body?.properties ??
-    schema.data?.properties ??
-    {};
-
-  const entries = Object.entries(properties);
-
-  if (entries.length === 0) {
-    return [
-      "| Property | Type | Required | Description |",
-      "| --- | --- | --- | --- |",
-      "| — | — | — | — |",
-    ].join("\n");
-  }
-
-  const required = new Set(
-    Array.isArray(schema.required) ? schema.required : [],
-  );
-
-  const lines = [
-    "| Property | Type | Required | Description |",
-    "| --- | --- | --- | --- |",
-  ];
-
-  for (const [name, definition] of entries) {
-    const type =
-      definition?.type ?? (Array.isArray(definition?.enum) ? "enum" : "object");
-
-    const description = definition?.description ?? "";
-
-    lines.push(
-      `| \`${escapeMarkdownValue(name)}\` | \`${escapeMarkdownValue(
-        type,
-      )}\` | ${required.has(name) ? "Yes" : "No"} | ${escapeMarkdownValue(
-        description,
-      )} |`,
-    );
-  }
-
-  return lines.join("\n");
-}
-
 async function exists(target) {
   try {
     await fs.access(target);
@@ -654,188 +695,17 @@ async function exists(target) {
   }
 }
 
-function formatHandlerTitle(handlerName) {
-  if (!handlerName) return "Unresolved Handler";
-
-  return handlerName
-    .replace(/[_-]+/g, " ")
-    .replace(/\b\w/g, (char) => char.toUpperCase())
-    .replace(/\bApi\b/g, "API");
-}
-
-function renderBodySection(request) {
-  if (!request.defined) {
-    return "_No schema defined for this route — request shape is unvalidated (`schema: { body: {} }`)._";
-  }
-  const rows = mergeFieldsWithLogic(request.body, request.logic);
-  const lines = [
-    "**Body**",
-    "",
-    "| Field | Type | Required | Constraints | Description |",
-    "|---|---|---|---|---|",
-  ];
-  if (rows.length === 0) {
-    lines.push("| _(none)_ | — | — | — | — |");
-  } else {
-    for (const r of rows) {
-      lines.push(
-        `| ${r.field} | ${r.type} | ${renderRequiredCell(r.required)} | ${r.constraints ?? "—"} | ${r.enum ? `enum: ${r.enum.join(", ")}` : "—"} |`,
-      );
-    }
-  }
-  const groupLines = renderLogicGroups(request.logic);
-  if (groupLines.length) lines.push("", ...groupLines);
-  return lines.join("\n");
-}
-
-function renderRequiredCell(required) {
-  if (required === "conditional" || required === "optional (group)")
-    return required;
-  return required ? "**Yes**" : "No";
-}
-
-function renderLogicGroups(logic) {
-  const lines = [];
-  if (logic?.or) {
-    for (const group of logic.or) {
-      const props = group.properties.map((p) => `\`${p}\``).join(", ");
-      lines.push(
-        group.required
-          ? `> **or** — at least one of the following is required: ${props}${group.type ? ` (type: \`${group.type}\`)` : ""}`
-          : `> **or** — at most one of the following applies, none required: ${props}${group.type ? ` (type: \`${group.type}\`)` : ""}`,
-      );
-    }
-  }
-  if (logic?.and) {
-    for (const group of logic.and) {
-      const props = group.properties.map((p) => `\`${p}\``).join(", ");
-      lines.push(
-        group.required
-          ? `> **and** — all of the following are required together: ${props}`
-          : `> **and** — the following are validated together when present, not required: ${props}`,
-      );
-    }
-  }
-  return lines;
-}
-
-function escapeMarkdown(value) {
-  return String(value).replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
-}
-
-function renderResponseData(dataFields) {
-  if (!dataFields || dataFields.length === 0) {
-    return "_No `data` fields could be determined from this handler or its local helper functions._";
-  }
-
-  const lines = ["| Field | Type | Description |", "|---|---|---|"];
-
-  for (const field of dataFields) {
-    if (typeof field === "string") {
-      lines.push(`| \`${escapeMarkdown(field)}\` | — | — |`);
-
-      continue;
-    }
-
-    const name = field.field ?? field.name ?? "unknown";
-
-    const type = field.type ?? "any";
-
-    const description = field.description ?? "—";
-
-    lines.push(
-      `| \`${escapeMarkdown(name)}\` | ${escapeMarkdown(type)} | ${escapeMarkdown(description)} |`,
-    );
-  }
-
-  return lines.join("\n");
-}
-
-function renderExternalServices(services) {
-  if (!services || services.length === 0) return "none";
-  return services
-    .map(
-      (s) =>
-        `- \`${s.service}.${s.method}(...)\` — see [${s.service}](../services/${s.service}.md)`,
-    )
-    .join("\n");
-}
-
-async function renderApiIndex(handlerDocs, docsRoot) {
-  const apiDir = path.join(docsRoot, "api");
-
-  const lines = [
-    "# API Reference",
-    "",
-    "API documentation grouped by handler source file.",
-    "",
-    "| Handler | Routes | Category |",
-    "|---|---:|---|",
-  ];
-
-  for (const doc of handlerDocs) {
-    const firstRoute = doc.routes[0];
-
-    const categories = [
-      ...new Set(doc.routes.map((route) => route.category).filter(Boolean)),
-    ];
-
-    lines.push(
-      `| [${doc.fileName}](./${doc.fileName}.md) | ${doc.routes.length} | ${categories.join(", ") || "—"} |`,
-    );
-  }
-
-  await fs.writeFile(path.join(apiDir, "index.md"), lines.join("\n"), "utf8");
-}
-
-function renderRoute(route) {
-  const lines = [`## ${route.name}`, ""];
-
-  lines.push(
-    route.purpose ??
-      "_No description available — add a comment above this route entry._",
-    "",
-  );
-
-  lines.push(
-    `**Handler:** \`${route.handler?.name ?? "unresolved"}\` (${relFile(route.handler?.file)}${route.handler?.line ? `:${route.handler.line}` : ""})`,
-  );
-
-  lines.push(`**Security:** ${route.security ?? "none"}`, "");
-
-  lines.push("### Request", "");
-  lines.push(renderBodySection(route.request), "");
-
-  lines.push("### Response", "");
-
-  lines.push(
-    "See [StandardResponse](../datastructures/standard-response.md).",
-    "",
-  );
-
-  lines.push(renderResponseData(route.response.data), "");
-
-  lines.push(renderResponseVariants(route.response.variants), "");
-
-  lines.push("### External Services Used", "");
-
-  lines.push(renderExternalServices(route.externalServices), "");
-
-  lines.push("### Errors", "");
-
-  lines.push(renderErrors(route.errors), "");
-
-  return lines.join("\n");
-}
-
 async function renderRoutesJson(routes, docsRoot) {
   const agentsDir = path.join(docsRoot, "agents");
   await fs.mkdir(agentsDir, { recursive: true });
+
   const payload = routes.map((r) => ({
     $schema: "godprotocol/v1/route.schema.json",
     name: r.name,
     category: r.category,
     security: r.security,
+    method: r.method,
+    path: r.path,
     handler: r.handler
       ? {
           name: r.handler.name,
@@ -847,6 +717,10 @@ async function renderRoutesJson(routes, docsRoot) {
       defined: r.request.defined,
       body: r.request.body,
       logic: r.request.logic,
+      query: r.request.query,
+      queryLogic: r.request.queryLogic,
+      params: r.request.params,
+      paramsLogic: r.request.paramsLogic,
       confidence: r.request.confidence,
     },
     response: r.response,
@@ -854,6 +728,7 @@ async function renderRoutesJson(routes, docsRoot) {
     errors: r.errors,
     confidence: "extracted",
   }));
+
   await fs.writeFile(
     path.join(agentsDir, "routes.json"),
     JSON.stringify(payload, null, 2),
@@ -862,71 +737,4 @@ async function renderRoutesJson(routes, docsRoot) {
 
 function relFile(file) {
   return file ? path.relative(process.cwd(), file) : "unresolved";
-}
-
-function renderResponseVariants(responses) {
-  if (!responses || responses.length === 0) {
-    return "_No response statuses observed in this handler._";
-  }
-
-  const lines = [
-    "#### Response Statuses",
-    "",
-    "| Status | Code | OK | Data | Meaning |",
-    "|---|---|---|---|---|",
-  ];
-
-  for (const response of responses) {
-    const status = response.status != null ? response.status : "—";
-
-    const code = response.status_code ? `\`${response.status_code}\`` : "—";
-
-    const ok = response.ok == null ? "—" : response.ok ? "true" : "false";
-
-    const data = response.data?.length
-      ? response.data.map((field) => `\`${field}\``).join(", ")
-      : "—";
-
-    const meaning = response.meaning ?? "—";
-
-    lines.push(`| ${status} | ${code} | ${ok} | ${data} | ${meaning} |`);
-  }
-
-  return lines.join("\n");
-}
-
-function renderErrors(errors) {
-  const real = (errors ?? []).filter(
-    (e) => e.status !== null || e.status_code || e.meaning,
-  );
-
-  if (real.length === 0) {
-    return "_No error responses observed in this handler._";
-  }
-
-  const lines = ["| Status | Code | Meaning |", "|---|---|---|"];
-
-  for (const e of real) {
-    lines.push(
-      `| ${e.status ?? "—"} | ${
-        e.status_code ? `\`${e.status_code}\`` : "—"
-      } | ${e.meaning ?? "—"} |`,
-    );
-  }
-
-  return lines.join("\n");
-}
-
-function escapeMarkdownText(value) {
-  return String(value ?? "")
-    .replace(/\\/g, "\\\\")
-    .replace(/`/g, "\\`")
-    .replace(/\{/g, "\\{")
-    .replace(/\}/g, "\\}");
-}
-
-function markdownCode(value, language = "") {
-  const text = String(value ?? "");
-
-  return [`\`\`\`${language}`, text.replace(/```/g, "``\\`"), "```"].join("\n");
 }
